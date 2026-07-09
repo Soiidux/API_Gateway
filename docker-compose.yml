@@ -9,7 +9,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/datadocke
+      - postgres_data:/var/lib/postgresql/data
     networks:
       - gateway_net
     restart: always
@@ -39,6 +39,56 @@ services:
     networks:
       - gateway_net
     restart: always
+
+  gateway:
+    build: ./gateway
+    container_name: api_gateway_core
+    ports:
+      - "3000:3000"
+    networks:
+      - gateway_net
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+
+  user-service-1:
+    build: ./services/user-service
+    container_name: user_replica_1
+    networks:
+      - gateway_net
+
+  user-service-2:
+    build: ./services/user-service
+    container_name: user_replica_2
+    networks:
+      - gateway_net
+
+  user-service-3:
+    build: ./services/user-service
+    container_name: user_replica_3
+    networks:
+      - gateway_net
+
+
+  payment-service-1:
+    build: ./services/payment-service
+    container_name: payment_replica_1
+    networks:
+      - gateway_net
+
+  payment-service-2:
+    build: ./services/payment-service
+    container_name: payment_replica_2
+    networks:
+      - gateway_net
+
+  payment-service-3:
+    build: ./services/payment-service
+    container_name: payment_replica_3
+    networks:
+      - gateway_net
+  
 
 networks:
   gateway_net:
