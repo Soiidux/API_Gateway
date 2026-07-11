@@ -1,10 +1,10 @@
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import { createProxyMiddleware, type Options } from "http-proxy-middleware";
+import proxyServices from "./utils/proxyUtil.js";
+
 
 const app = express();
-
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
@@ -12,47 +12,21 @@ app.use(cors({
 }));
 app.use(helmet());
 
-const userReplicas = [
-  "http://user-service-1:3001",
-  "http://user-service-2:3001",
-  "http://user-service-3:3001",
-]
 
-const paymentReplicas = [
-  "http://payment-service-1:3002",
-  "http://payment-service-2:3002",
-  "http://payment-service-3:3002",
-]
+app.use(express.json());
 
-let userIndex = 0;
-let paymentIndex = 0;
+proxyServices(app);
 
-const userProxyOptions: Options = {
-  router: () => {
-    const target = userReplicas[userIndex];
-    userIndex = (userIndex + 1) % userReplicas.length;
-    console.log(`[Proxy] Forwarding /api/v1/users request to -> ${target}`);
-    return target || userReplicas[0];
-  },
-  pathFilter: "/api/v1/users/**",
-  target:userReplicas[0] || "http://user-service-1:3001",
-  changeOrigin: true,
-}
 
-const paymentProxyOptions: Options = {
-  router: () => {
-    const target = paymentReplicas[paymentIndex];
-    paymentIndex = (paymentIndex + 1) % paymentReplicas.length;
-    console.log(`[Proxy] Forwarding /api/v1/payments request to -> ${target}`);
-    return target || paymentReplicas[0];
-  },
-  pathFilter: "/api/v1/payments/**",
-  target: paymentReplicas[0] || "http://payment-service-1:3002",
-  changeOrigin: true,
-}
-
-app.use(createProxyMiddleware(userProxyOptions));
-app.use(createProxyMiddleware(paymentProxyOptions));
+// Inside User/Payment Service index.ts (at the very bottom)
+app.use((err: any, req: any, res: any, next: any) => {
+  console.error("🔥 Gateway CRASHED:", err.stack || err);
+  return res.status(500).json({
+    success: false,
+    message: "Internal Microservice Error",
+    error: err.message
+  });
+});
 
 app.listen(3000, () => {
   console.log("[Proxy] Gateway is running on port 3000");

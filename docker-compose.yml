@@ -43,6 +43,11 @@ services:
   gateway:
     build: ./gateway
     container_name: api_gateway_core
+    environment:
+      PORT: 3000
+      JWT_SECRET: gateway_secret_is_super_secure
+      USER_SERVICE_URLS: http://user-service-1:3001,http://user-service-2:3001,http://user-service-3:3001
+      PAYMENT_SERVICE_URLS: http://payment-service-1:3002,http://payment-service-2:3002,http://payment-service-3:3002
     ports:
       - "3000:3000"
     networks:
@@ -55,18 +60,30 @@ services:
   user-service-1:
     build: ./services/user-service
     container_name: user_replica_1
+    environment:
+      PORT: 3001
+      INSTANCE_ID: 1
+      JWT_SECRET: gateway_secret_is_super_secure
     networks:
       - gateway_net
 
   user-service-2:
     build: ./services/user-service
     container_name: user_replica_2
+    environment:
+      PORT: 3001
+      INSTANCE_ID: 2
+      JWT_SECRET: gateway_secret_is_super_secure
     networks:
       - gateway_net
 
   user-service-3:
     build: ./services/user-service
     container_name: user_replica_3
+    environment:
+      PORT: 3001
+      INSTANCE_ID: 3
+      JWT_SECRET: gateway_secret_is_super_secure
     networks:
       - gateway_net
 
@@ -74,18 +91,27 @@ services:
   payment-service-1:
     build: ./services/payment-service
     container_name: payment_replica_1
+    environment:
+      PORT: 3002
+      INSTANCE_ID: 1
     networks:
       - gateway_net
 
   payment-service-2:
     build: ./services/payment-service
     container_name: payment_replica_2
+    environment:
+      PORT: 3002
+      INSTANCE_ID: 2
     networks:
       - gateway_net
 
   payment-service-3:
     build: ./services/payment-service
     container_name: payment_replica_3
+    environment:
+      PORT: 3002
+      INSTANCE_ID: 3
     networks:
       - gateway_net
   
