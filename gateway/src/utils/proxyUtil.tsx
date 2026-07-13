@@ -1,4 +1,4 @@
-import { type Application } from "express";
+import { type Application, type NextFunction, type Response , type Request} from "express";
 import { createProxyMiddleware, type Options, fixRequestBody } from "http-proxy-middleware";
 import config from "../config.js";
 import RoundRobinLoadBalancer from "./loadBalancer.js";
@@ -29,15 +29,36 @@ class ProxyUtil {
     }
   ];
 
+  //one balancer per service path
+  private static balancers = new Map<string, RoundRobinLoadBalancer>();
+
+
+  private static selectServer(serviceName: string) {
+    return (req: Request, res: Response, next: NextFunction) => {
+      const balancer = ProxyUtil.balancers.get(serviceName);
+      try {
+        req.proxyServer = balancer!.getNextServer();
+        req.proxyServiceName = serviceName;
+        next();
+      }
+      catch (error) {
+        const responsePayload: ApiResponse<null> = {
+          message: 'Service unavailable: ' + new Date().toISOString() + ' ' + (error as Error).message,
+          status: 503,
+          success: false,
+          data: null,
+        };
+        return res.status(503).json(responsePayload);
+      }
+    }
+  }
   private static createProxyOptions(serviceConfig: ServiceConfig): Options {
-    const balancer = new RoundRobinLoadBalancer(serviceConfig.urls);
     return {
       target: serviceConfig.urls[0]!,
       changeOrigin: true,
       timeout: serviceConfig.timeout ?? 5000,
-      router: () => {
-        const target = balancer.getNextServer();
-        return target;
+      router: (req: any) => {
+        return req.proxyServer;
       },
       on: {
         error: ProxyUtil.handleProxyError,
@@ -48,8 +69,13 @@ class ProxyUtil {
   }
 
   private static handleProxyError(err: Error, req: any, res: any): void {
+    const balancer = ProxyUtil.balancers.get(req.proxyServiceName);
+    if (req.proxyServer) {
+      balancer?.recordFailure(req.proxyServer);
+    }
+    
     const errorResponse: ApiResponse<null> = {
-      message: 'Service unavailable: ' + new Date().toISOString() + ' ' + err.message,
+      message: 'Service unavailable: ' + new Date().toISOString() + ' ' + (err as Error).message,
       status: 503,
       success: false,
       data: null,
@@ -75,13 +101,19 @@ class ProxyUtil {
   }
 
   private static handleProxyResponse(proxyRes: any, req: any): void {
-    // logger.debug(`Received response for ${req.path}`);
+    const balancer = ProxyUtil.balancers.get(req.proxyServiceName);
+    if (req.proxyServer) {
+      balancer?.recordSuccess(req.proxyServer);
+    } else {
+      balancer?.recordFailure(req.proxyServer);
+    }
   }
 
   public static setUpProxy(app: Application): void {
-    ProxyUtil.serviceConfigs.forEach((config) => {
-      const proxyOptions: Options = ProxyUtil.createProxyOptions(config);
-      app.use(config.path, conditionalAuth(config.publicRoutes, config.roleMap, config.defaultRoles), validateBody(config.bodySchemas), createProxyMiddleware(proxyOptions));
+    ProxyUtil.serviceConfigs.forEach((service) => {
+      ProxyUtil.balancers.set(service.name, new RoundRobinLoadBalancer(service.urls));
+      const proxyOptions: Options = ProxyUtil.createProxyOptions(service);
+      app.use(service.path, conditionalAuth(service.publicRoutes, service.roleMap, service.defaultRoles), validateBody(service.bodySchemas), ProxyUtil.selectServer(service.name), createProxyMiddleware(proxyOptions));
     })
   }
 }
