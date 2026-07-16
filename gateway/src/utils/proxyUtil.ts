@@ -5,7 +5,7 @@ import RoundRobinLoadBalancer from "./loadBalancer.js";
 import conditionalAuth from "../middlewares/conditionalAuth.js";
 import * as schema from "../libs/zod.schemas.js";
 import validateBody from "../middlewares/validateBody.js";
-
+import rateLimitMiddleware from "../middlewares/rateLimitMiddleware.js";
 class ProxyUtil {
   // ---------------------------------------------------------------------
   // The list of backend services this gateway knows how to proxy to.
@@ -19,7 +19,7 @@ class ProxyUtil {
       urls: config.USER_SERVICE_URLS,      // list of instance URLs (round robin targets)
       name: "user-service",                // used as the key for this service's load balancer
       timeout: 5000,                       // how long to wait before giving up on a request
-      publicRoutes: ["/register"],         // no JWT required for these
+      publicRoutes: ["/register","/"],         // no JWT required for these
       roleMap: {
         "/getAll": ["ADMIN", "MANAGER"],   // only these roles may call /getAll
       },
@@ -204,9 +204,10 @@ class ProxyUtil {
       app.use(
         service.path,
         conditionalAuth(service.publicRoutes, service.roleMap, service.defaultRoles), // 1. check JWT + role
-        validateBody(service.bodySchemas),                                            // 2. validate body shape
-        ProxyUtil.selectServer(service.name),                                         // 3. pick a healthy server
-        createProxyMiddleware(proxyOptions),                                          // 4. forward the request
+        rateLimitMiddleware,                                                          // 2. rate limit
+        validateBody(service.bodySchemas),                                            // 3. validate body shape
+        ProxyUtil.selectServer(service.name),                                         // 4. pick a healthy server
+        createProxyMiddleware(proxyOptions),                                          // 5. forward the request
       );
     });
   }

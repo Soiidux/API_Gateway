@@ -19,6 +19,7 @@
     "express": "^5.2.1",
     "helmet": "^8.2.0",
     "http-proxy-middleware": "^4.2.0",
+    "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.3",
     "zod": "^4.4.3"
   },
@@ -26,6 +27,7 @@
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/helmet": "^0.0.48",
+    "@types/ioredis": "^4.28.10",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.1.1",
     "tsc-watch": "^7.2.1",

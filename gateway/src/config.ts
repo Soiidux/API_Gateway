@@ -7,6 +7,7 @@ const config: Config = {
   JWT_SECRET: process.env.JWT_SECRET || "",
   USER_SERVICE_URLS: process.env.USER_SERVICE_URLS ? getServiceUrls(process.env.USER_SERVICE_URLS) : [],
   PAYMENT_SERVICE_URLS: process.env.PAYMENT_SERVICE_URLS ? getServiceUrls(process.env.PAYMENT_SERVICE_URLS) : [],
+  REDIS_URL: process.env.REDIS_URL || "",
 }
 
 export default config;

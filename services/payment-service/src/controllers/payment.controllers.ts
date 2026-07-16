@@ -24,3 +24,13 @@ export const getPayments = (req: Request, res: Response) => {
   };
   return res.status(apiResponsePayload.status).json(apiResponsePayload);
 }
+
+export const rateLimiterCheck = (req: Request, res: Response) => {
+  const resPayload: ApiResponse<null> = {
+    success: true,
+    message: 'Rate limit check passed',
+    data: null,
+    status: 200
+  };
+  return res.status(resPayload.status).json(resPayload);
+}

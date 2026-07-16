@@ -12,6 +12,7 @@ declare global {
     JWT_SECRET: string;
     USER_SERVICE_URLS: string[];
     PAYMENT_SERVICE_URLS: string[];
+    REDIS_URL: string;
   }
   interface ServiceConfig {
     path: string;

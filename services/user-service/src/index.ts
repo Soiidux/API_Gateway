@@ -1,6 +1,6 @@
 import express from "express";
 import dotenv from "dotenv";
-import { getUsers, registerUser } from "./controllers/user.controllers.js";
+import { getUsers, rateLimiterCheck, registerUser } from "./controllers/user.controllers.js";
 dotenv.config();
 
 const app = express();
@@ -9,6 +9,7 @@ const PORT = parseInt(process.env.PORT || "3001");
 
 app.get("/getAll", getUsers);
 app.post("/register", registerUser);
+app.get("/", rateLimiterCheck);
 
 app.listen(PORT, () => {
   console.log(`User Service ${process.env.INSTANCE_ID} running internally on port ${PORT}`)

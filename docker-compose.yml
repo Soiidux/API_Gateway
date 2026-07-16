@@ -48,6 +48,7 @@ services:
       JWT_SECRET: gateway_secret_is_super_secure
       USER_SERVICE_URLS: http://user-service-1:3001,http://user-service-2:3001,http://user-service-3:3001
       PAYMENT_SERVICE_URLS: http://payment-service-1:3002,http://payment-service-2:3002,http://payment-service-3:3002
+      REDIS_URL: redis://gateway_redis:6379
     ports:
       - "3000:3000"
     networks:
