@@ -1,11 +1,15 @@
 import { type Application, type NextFunction, type Response, type Request } from "express";
-import { createProxyMiddleware, type Options, fixRequestBody } from "http-proxy-middleware";
+import { createProxyMiddleware, type Options, fixRequestBody , responseInterceptor} from "http-proxy-middleware";
 import config from "../config.js";
 import RoundRobinLoadBalancer from "./loadBalancer.js";
 import conditionalAuth from "../middlewares/conditionalAuth.js";
 import * as schema from "../libs/zod.schemas.js";
 import validateBody from "../middlewares/validateBody.js";
 import rateLimitMiddleware from "../middlewares/rateLimitMiddleware.js";
+import redisClient from "../db/redisClient.js";
+import cacheMiddleware from "../middlewares/cacheMiddleware.js";
+
+
 class ProxyUtil {
   // ---------------------------------------------------------------------
   // The list of backend services this gateway knows how to proxy to.
@@ -26,12 +30,18 @@ class ProxyUtil {
       bodySchemas: {
         "/register": schema.registerUserSchema, // validate request body against this schema
       },
+      cachebleRoutes: {
+        "/getAll": { ttl: 15 * 60 * 1000 },
+      },
     },
     {
       path: "/api/v1/payments",
       urls: config.PAYMENT_SERVICE_URLS,
       name: "payment-service",
       defaultRoles: ["ADMIN"],             // EVERY route in this service requires ADMIN, unless overridden in roleMap
+      cachebleRoutes: {
+        "/getAll": { ttl: 15 * 60 * 1000 },
+      },
     },
   ];
 
@@ -100,11 +110,11 @@ class ProxyUtil {
       router: (req: any) => {
         return req.proxyServer;
       },
-
+      selfHandleResponse: true, //required for responseInterceptor to work
       on: {
         error: ProxyUtil.handleProxyError,     // fires if the request to the backend fails (down, timeout, refused)
         proxyReq: ProxyUtil.handleProxyRequest, // fires right before the request is sent to the backend
-        proxyRes: ProxyUtil.handleProxyResponse, // fires when a response comes back from the backend
+        proxyRes: responseInterceptor(ProxyUtil.handleProxyResponse), // fires when a response comes back from the backend
       },
     };
   }
@@ -168,20 +178,66 @@ class ProxyUtil {
    * (this includes error responses like 404/500 — it just means the
    * server was reachable and responded).
    */
-  private static handleProxyResponse(proxyRes: any, req: any): void {
-    const balancer = ProxyUtil.balancers.get(req.proxyServiceName);
-    if (req.proxyServer) {
-      // server responded -> tell its breaker "that worked", resetting
-      // its failure count
-      balancer?.recordSuccess(req.proxyServer);
-    } else {
-      // this branch should basically never run in practice — if
-      // selectServer() couldn't pick a server, it already sent a 503
-      // and next() was never called, so we'd never reach the proxy
-      // at all. Kept here defensively.
-      balancer?.recordFailure(req.proxyServer);
-    }
-  }
+   /**
+    * Runs after the backend service responds, but BEFORE that response
+    * is sent back to the client. Two jobs:
+    *
+    *   1. Report success/failure back to this server's circuit breaker
+    *      (same purpose as before — just moved here, see note below).
+    *   2. If this route was marked cacheable by cacheCheck middleware
+    *      (req.cacheKey is set) and the response was a clean 200,
+    *      store it in Redis so future identical requests can be served
+    *      from cache instead of hitting the backend again.
+    *
+    * NOTE: this replaces the old plain `on.proxyRes` handler. Reading
+    * the full response body requires `selfHandleResponse: true` on the
+    * proxy options, which changes how the response is handled overall —
+    * responseInterceptor buffers the whole body for us and expects this
+    * function to return the (possibly unmodified) body to send onward.
+    */
+   private static async handleProxyResponse(
+     responseBuffer: Buffer,
+     proxyRes: any,
+     req: any,
+     res: any,
+   ): Promise<Buffer> {
+     // --- 1. circuit breaker reporting (unchanged logic, moved here) ---
+     const balancer = ProxyUtil.balancers.get(req.proxyServiceName);
+     if (req.proxyServer) {
+       // we got a response at all -> the server is reachable -> success,
+       // regardless of whether the response body itself is an error.
+       // (a 404/500 from the backend still means the network path is fine)
+       balancer?.recordSuccess(req.proxyServer);
+     }
+     // NOTE: the old "else -> recordFailure" branch is intentionally
+     // removed. It could never actually run — selectServer() already
+     // guarantees req.proxyServer is set before the proxy is ever
+     // reached, or it responds with 503 and next() is never called.
+   
+     // --- 2. write to cache, if this route is cacheable ---
+     // req.cacheKey / req.cacheTtl are only set by cacheCheck middleware
+     // when this specific route was configured as cacheable AND the
+     // request was a cache MISS (a HIT would have short-circuited
+     // before ever reaching the proxy).
+     if (req.cacheKey && proxyRes.statusCode === 200) {
+       try {
+         const payload = JSON.stringify({
+           status: proxyRes.statusCode,
+           body: responseBuffer.toString("utf8"),
+           contentType: proxyRes.headers["content-type"] ?? "application/json",
+         });
+         await redisClient.set(req.cacheKey, payload, "EX", req.cacheTtl ?? 60);
+       } catch (err) {
+         // caching failure should never break the actual response —
+         // log it and move on, the client still gets their data
+         console.error("Failed to write response to cache:", err);
+       }
+     }
+   
+     // hand the body back unmodified — this is what actually gets sent
+     // to the client (responseInterceptor requires a return value)
+     return responseBuffer;
+   }
 
   /**
    * Registers all configured services onto the Express app.
@@ -205,9 +261,10 @@ class ProxyUtil {
         service.path,
         conditionalAuth(service.publicRoutes, service.roleMap, service.defaultRoles), // 1. check JWT + role
         rateLimitMiddleware,                                                          // 2. rate limit
-        validateBody(service.bodySchemas),                                            // 3. validate body shape
-        ProxyUtil.selectServer(service.name),                                         // 4. pick a healthy server
-        createProxyMiddleware(proxyOptions),                                          // 5. forward the request
+        cacheMiddleware(service.cachebleRoutes ?? {}),                                // 3. cache middleware
+        validateBody(service.bodySchemas),                                            // 4. validate body shape
+        ProxyUtil.selectServer(service.name),                                         // 5. pick a healthy server
+        createProxyMiddleware(proxyOptions),                                          // 6. forward the request
       );
     });
   }

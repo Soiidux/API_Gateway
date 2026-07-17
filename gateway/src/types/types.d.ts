@@ -23,6 +23,9 @@ declare global {
     roleMap?: Record<string, string[]>;
     defaultRoles?: string[];
     bodySchemas?: Record<string, z.ZodSchema>;
+    cachebleRoutes?: Record<string, {
+      ttl: number;
+    }>;
   }
 }
 

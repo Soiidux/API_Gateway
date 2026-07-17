@@ -3,6 +3,8 @@ declare global {
     interface Request {
       proxyServer: string;
       proxyServiceName: string;
+      cacheKey: string;
+      cacheTTL: number;
     }
   }
 }
