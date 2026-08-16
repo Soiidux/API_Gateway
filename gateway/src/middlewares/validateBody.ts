@@ -22,7 +22,11 @@ const validateBody = (bodySchemas: Record<string, z.ZodSchema> = {}) => {
       req.body = result.data;
       next();
     } catch (error) {
-      const responsePayload : ApiResponse<null> = generateApiResponse<null>(null, "Internal Server Error: " + (error as Error).message, 500)
+      // Defensive catch; zod's safeParseAsync never throws on bad data.
+      // Log the real error server-side, send a generic message — don't
+      // leak internals to the caller.
+      console.error("validateBody unexpected error:", error);
+      const responsePayload : ApiResponse<null> = generateApiResponse<null>(null, "Internal Server Error", 500)
       return res.status(responsePayload.status).json(responsePayload);
     }
   };

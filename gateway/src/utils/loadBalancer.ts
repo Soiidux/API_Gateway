@@ -31,13 +31,17 @@ export default class RoundRobinLoadBalancer {
     }
   }
 
-  // Round-robin: advance the index each call, skip servers whose breaker
-  // is open, and fail if every instance is currently unavailable.
+  // Round-robin: only advance the rotation pointer when a server is
+  // actually RETURNED. Skipped probes (open breakers) don't move the
+  // pointer, so after a burst of blocked requests the rotation doesn't
+  // drift — the next healthy pick still starts where round-robin left off.
   getNextServer(): string{
     for (let i = 0; i < this.servers.length; i++){
-      const serverUrl = this.servers[this.index];
-      this.index = (this.index + 1) % this.servers.length;
+      const probeIndex = (this.index + i) % this.servers.length;
+      const serverUrl = this.servers[probeIndex];
       if (this.circuitBreakersMap.get(serverUrl!)?.canRequest()) {
+        // commit the pointer so the NEXT call starts after this server
+        this.index = (probeIndex + 1) % this.servers.length;
         return serverUrl!;
       }
     }

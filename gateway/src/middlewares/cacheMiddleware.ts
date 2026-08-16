@@ -43,7 +43,8 @@ export class CacheMiddleware {
       if (!matchKey) return next();
 
       // build the Redis key this request's response would be stored under
-      // (method + URL — see utils/cacheKey.ts; NOTE: not user-scoped!)
+      // (method + URL, scoped by x-user-id when authenticated — see
+      // utils/cacheKey.ts: two users never share a cache entry)
       const cacheKey = buildCacheKey(req);
 
       // stash the key + this route's TTL on req, so the proxy's response

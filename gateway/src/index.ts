@@ -27,11 +27,14 @@ app.use(express.json());
 proxyServices(app);
 
 app.use((err: any, req: any, res: any, next: any) => {
+  // Log the full stack server-side for debugging, but never echo it to
+  // the client — leaked messages (framework versions, internal paths)
+  // are how attackers probe the stack.
   console.error("🔥 Gateway CRASHED:", err.stack || err);
   return res.status(500).json({
     success: false,
     message: "Internal Microservice Error",
-    error: err.message
+    status: 500,
   });
 });
 
