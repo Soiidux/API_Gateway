@@ -5,11 +5,31 @@ import RoundRobinLoadBalancer from "./loadBalancer.js";
 import conditionalAuth from "../middlewares/conditionalAuth.js";
 import * as schema from "../libs/zod.schemas.js";
 import validateBody from "../middlewares/validateBody.js";
-import rateLimitMiddleware from "../middlewares/rateLimitMiddleware.js";
+import RateLimitMiddleware from "../middlewares/rateLimitMiddleware.js";
 import redisClient from "../db/redisClient.js";
-import cacheMiddleware from "../middlewares/cacheMiddleware.js";
+import CacheMiddleware from "../middlewares/cacheMiddleware.js";
+import RequestLogger from "../middlewares/RequestLogger.js";
+import logPublisher from "./rabbitMq/index.js";
 
-
+/**
+ * The gateway's "brain": declares every backend service and the full
+ * middleware chain applied to requests for it, plus the proxy handlers.
+ *
+ * Lifecycle per request (setUpProxy shows the wiring):
+ *   1. RequestLogger.create()   log on response 'finish'
+ *   2. conditionalAuth(...)     JWT + RBAC
+ *   3. RateLimitMiddleware      publishEvent on 429
+ *   4. CacheMiddleware          publishEvent on hit/miss
+ *   5. validateBody(...)        zod body validation
+ *   6. ProxyUtil.selectServer   pick a server via the balancer
+ *   7. createProxyMiddleware    forward + log error events
+ *
+ * Logging fires in layers (1, 3, 4, 7) plus circuit-breaker hooks bound
+ * per balancer — all via the shared rabbitMq singleton so one connection
+ * serves every producer. Everything produced by `create()`/the factories
+ * is a plain function, so the components compose trivially in the array
+ * passed to app.use.
+ */
 class ProxyUtil {
   // ---------------------------------------------------------------------
   // The list of backend services this gateway knows how to proxy to.
@@ -132,6 +152,12 @@ class ProxyUtil {
       balancer?.recordFailure(req.proxyServer);
     }
 
+    void logPublisher.publishEvent("error", "Upstream proxy error", {
+      service: req.proxyServiceName,
+      server: req.proxyServer ?? null,
+      error: (err as Error).message,
+    });
+
     // respond to the client with a generic "service unavailable"
     const errorResponse: ApiResponse<null> = {
       message: 'Service unavailable: ' + new Date().toISOString() + ' ' + (err as Error).message,
@@ -151,8 +177,6 @@ class ProxyUtil {
    * that conditionalAuth attached earlier in the chain.
    */
   private static handleProxyRequest(proxyReq: any, req: any): void {
-    console.log("Proxy hit");
-
     // express.json() (earlier in the chain) already consumed the
     // original request stream to populate req.body — so we need to
     // manually re-write it onto the outgoing proxy request, otherwise
@@ -170,6 +194,12 @@ class ProxyUtil {
     }
     if (req.headers["x-user-role"]) {
       proxyReq.setHeader("x-user-role", req.headers["x-user-role"] as string);
+    }
+
+    // RequestLogger stamped a request id on every request — pass it down
+    // so backend services can log under the SAME correlation id.
+    if (req.headers["x-request-id"]) {
+      proxyReq.setHeader("x-request-id", req.headers["x-request-id"] as string);
     }
   }
 
@@ -226,7 +256,7 @@ class ProxyUtil {
            body: responseBuffer.toString("utf8"),
            contentType: proxyRes.headers["content-type"] ?? "application/json",
          });
-         await redisClient.set(req.cacheKey, payload, "EX", req.cacheTtl ?? 60);
+         await redisClient.set(req.cacheKey, payload, "EX", req.cacheTTL ?? 60);
        } catch (err) {
          // caching failure should never break the actual response —
          // log it and move on, the client still gets their data
@@ -243,7 +273,7 @@ class ProxyUtil {
    * Registers all configured services onto the Express app.
    * For each service, builds this middleware chain:
    *
-   *   conditionalAuth -> validateBody -> selectServer -> proxy
+   *   requestLogger -> conditionalAuth -> rateLimit -> cache -> validateBody -> selectServer -> proxy
    *
    * (express.json() is expected to run before this, elsewhere,
    * so req.body is already parsed by the time validateBody runs)
@@ -252,19 +282,30 @@ class ProxyUtil {
     ProxyUtil.serviceConfigs.forEach((service) => {
       // create this service's load balancer BEFORE registering the
       // routes, so it's guaranteed to exist by the time any request
-      // comes in and selectServer() looks it up
-      ProxyUtil.balancers.set(service.name, new RoundRobinLoadBalancer(service.urls));
+      // comes in and selectServer() looks it up. The logEvent hook
+      // publishes whenever a server's circuit breaker trips/recovers.
+      ProxyUtil.balancers.set(
+        service.name,
+        new RoundRobinLoadBalancer(service.urls, (serverUrl, state) => {
+          void logPublisher.publishEvent(
+            state === "OPEN" ? "warn" : "info",
+            `Circuit breaker ${state} for ${serverUrl}`,
+            { serverUrl, state, service: service.name },
+          );
+        }),
+      );
 
       const proxyOptions: Options = ProxyUtil.createProxyOptions(service);
 
       app.use(
         service.path,
-        conditionalAuth(service.publicRoutes, service.roleMap, service.defaultRoles), // 1. check JWT + role
-        rateLimitMiddleware,                                                          // 2. rate limit
-        cacheMiddleware(service.cachebleRoutes ?? {}),                                // 3. cache middleware
-        validateBody(service.bodySchemas),                                            // 4. validate body shape
-        ProxyUtil.selectServer(service.name),                                         // 5. pick a healthy server
-        createProxyMiddleware(proxyOptions),                                          // 6. forward the request
+        RequestLogger.create(),                                                          // 1. log every request (fires on response finish)
+        conditionalAuth(service.publicRoutes, service.roleMap, service.defaultRoles), // 2. check JWT + role
+        RateLimitMiddleware.create(),                                                    // 3. rate limit
+        CacheMiddleware.create(service.cachebleRoutes ?? {}),                            // 4. cache middleware
+        validateBody(service.bodySchemas),                                            // 5. validate body shape
+        ProxyUtil.selectServer(service.name),                                         // 6. pick a healthy server
+        createProxyMiddleware(proxyOptions),                                          // 7. forward the request
       );
     });
   }

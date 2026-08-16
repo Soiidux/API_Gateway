@@ -1,0 +1,33 @@
+{
+  "name": "log-worker",
+  "version": "1.0.0",
+  "description": "Consumes API gateway logs from RabbitMQ and persists them to Postgres",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/index.js",
+    "dev": "tsc-watch --onSuccess \"npm run start\"",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "test": "node --import tsx --test src/BatchBuffer.test.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "amqplib": "^2.0.1",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.8",
+    "@types/node": "^26.2.0",
+    "@types/pg": "^8.21.0",
+    "drizzle-kit": "^0.31.10",
+    "tsc-watch": "^7.2.1",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}

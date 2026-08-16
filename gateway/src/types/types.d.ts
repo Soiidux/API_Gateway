@@ -13,6 +13,7 @@ declare global {
     USER_SERVICE_URLS: string[];
     PAYMENT_SERVICE_URLS: string[];
     REDIS_URL: string;
+    RABBITMQ_URL: string;
   }
   interface ServiceConfig {
     path: string;

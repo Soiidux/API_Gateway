@@ -1,29 +1,38 @@
-import CircuitBreaker from "./circuitBreaker.js";
+import CircuitBreaker, { type BreakerState } from "./circuitBreaker.js";
 
-/*
-picks which server to send a request to, cycling through them (round robin), while skipping any that their CircuitBreaker says are blocked.
-It has 3 state variables:
-  1.index: It remembers our position in the server list so round robin can continue from where we left off.
-  2.servers: It is the list of server URLS of a particular service.
-  3.circuitBreakersMap: It is a map of server URLS to their corresponding CircuitBreaker instances. Every server URL has an independent CircuitBreaker instance.
-
-It has 3 methods:
-  1.getNextServer(): string: Returns the next server URL to send a request to, using round robin and skipping any that are blocked by their CircuitBreaker.
-  2.recordSuccess(serverUrl: string): void: Records a successful request for the given server URL, updating its CircuitBreaker.
-  3.recordFailure(serverUrl: string): void: Records a failed request for the given server URL, updating its CircuitBreaker.
-*/
+/**
+ * Round-robin load balancer with per-server circuit breakers.
+ *
+ * Owns one CircuitBreaker per server URL. When building each breaker it
+ * pins the URL in via a closure:
+ *     (state) => this.logEvent(serverUrl, state)
+ * The closure captures serverUrl so the breaker (which is generic and
+ * knows nothing about URLs) still reports its state changes with the
+ * right context — the observer stays decoupled, the callback adds detail.
+ *
+ * logEvent defaults to a no-op so callers that construct a balancer
+ * without logging keep working (a non-breaking additive change).
+ */
 export default class RoundRobinLoadBalancer {
-  private index = 0; // The current index into the servers array
-  private readonly circuitBreakersMap: Map<string, CircuitBreaker>; // A map of server URLS to their corresponding CircuitBreaker instances
-  constructor(private readonly servers: string[]) { // The constructor takes an array of server URLS and initializes the circuitBreakersMap
+  private index = 0;
+  private readonly circuitBreakersMap: Map<string, CircuitBreaker>;
+  constructor(
+    private readonly servers: string[],
+    private readonly logEvent: (serverUrl: string, state: BreakerState) => void = () => {},
+  ) {
     if (!servers.length) throw new Error("RoundRobinLoadBalancer requires at least one server");
-    this.circuitBreakersMap = new Map(servers.map(serverUrl => [serverUrl, new CircuitBreaker()]))
+    this.circuitBreakersMap = new Map();
+    for (const serverUrl of servers) {
+      this.circuitBreakersMap.set(
+        serverUrl,
+        // closure: pins serverUrl into the breaker's onStateChange hook
+        new CircuitBreaker(5, 30000, (state) => this.logEvent(serverUrl, state)),
+      );
+    }
   }
 
-  // Returns the next server URL to send a request to in the following steps:
-  // 1. Get the current server URL at the index, and increment the index for the next call. (Round robin)
-  // 2. If the server URL is not blocked by its CircuitBreaker, return it.
-  // 3. If all server URLs are blocked, throw an error, i.e no server url is returned.
+  // Round-robin: advance the index each call, skip servers whose breaker
+  // is open, and fail if every instance is currently unavailable.
   getNextServer(): string{
     for (let i = 0; i < this.servers.length; i++){
       const serverUrl = this.servers[this.index];
@@ -35,11 +44,9 @@ export default class RoundRobinLoadBalancer {
     throw new Error("All upstream instances are unavailable");
   }
 
-  // Records a successful request for the given server URL, updating its CircuitBreaker.
   recordSuccess(serverUrl: string) : void {
     this.circuitBreakersMap.get(serverUrl)?.recordSuccess();
   }
-  // Records a failed request for the given server URL, updating its CircuitBreaker.
   recordFailure(serverUrl: string) : void {
     this.circuitBreakersMap.get(serverUrl)?.recordFailure();
   }

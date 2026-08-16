@@ -1,3 +1,13 @@
+# Describes every container as a "service". `docker-compose up --build`
+# builds images and starts them all on one private network, where they
+# find each other by SERVICE NAME as the hostname:
+#
+#   gateway    → rabbitmq:5672 (log-queue producer)
+#   log-worker → rabbitmq:5672 + postgres:5432 (consumer → writer)
+#
+# URLs therefore use service names, NOT localhost — containers on the
+# same network resolve each other by name; localhost inside a container
+# is the container itself.
 services:
   postgres:
     image: postgres:16-alpine
@@ -49,6 +59,7 @@ services:
       USER_SERVICE_URLS: http://user-service-1:3001,http://user-service-2:3001,http://user-service-3:3001
       PAYMENT_SERVICE_URLS: http://payment-service-1:3002,http://payment-service-2:3002,http://payment-service-3:3002
       REDIS_URL: redis://gateway_redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
     ports:
       - "3000:3000"
     networks:
@@ -57,6 +68,24 @@ services:
       - postgres
       - redis
       - rabbitmq
+
+  log-worker:
+    # The CONSUMER: pulls messages off the "api_gateway_logs" queue and
+    # batch-inserts them into postgres's gateway_db.logs table.
+    # depends_on just waits for postgres/rabbitmq CONTAINERS to start —
+    # our code is what actually waits (migrations before consuming, and
+    # the connect-retry loop in LogConsumer).
+    build: ./services/log-worker
+    container_name: log_worker
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      DATABASE_URL: postgres://gateway_user:gateway_secure_password@postgres:5432/gateway_db
+    networks:
+      - gateway_net
+    depends_on:
+      - postgres
+      - rabbitmq
+    restart: always
 
   user-service-1:
     build: ./services/user-service

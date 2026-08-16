@@ -5,6 +5,7 @@ declare global {
       proxyServiceName: string;
       cacheKey: string;
       cacheTTL: number;
+      requestId: string;
     }
   }
 }
