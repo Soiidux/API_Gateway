@@ -177,18 +177,11 @@ class ProxyUtil {
    * that conditionalAuth attached earlier in the chain.
    */
   private static handleProxyRequest(proxyReq: any, req: any): void {
-    // express.json() (earlier in the chain) already consumed the
-    // original request stream to populate req.body — so we need to
-    // manually re-write it onto the outgoing proxy request, otherwise
-    // the backend receives an empty body
-    if (req.body) {
-      fixRequestBody(proxyReq, req);
-    }
-
     // conditionalAuth attaches the authenticated user's id/role as
     // headers — forward those along so the backend service knows
-    // who's making the request, without the backend needing to
-    // verify the JWT itself
+    // who's making the request. These are informational only; the
+    // service (e.g. user-service requireAuth) re-verifies the actual
+    // JWT itself rather than trusting them blindly.
     if (req.headers["x-user-id"]) {
       proxyReq.setHeader("x-user-id", req.headers["x-user-id"] as string);
     }
@@ -196,10 +189,28 @@ class ProxyUtil {
       proxyReq.setHeader("x-user-role", req.headers["x-user-role"] as string);
     }
 
+    // Forward the raw Authorization header as well, so backends that do
+    // their own service-level JWT verification (defense in depth) can
+    // verify the token instead of trusting x-user-* headers.
+    if (req.headers["authorization"]) {
+      proxyReq.setHeader("authorization", req.headers["authorization"] as string);
+    }
+
     // RequestLogger stamped a request id on every request — pass it down
     // so backend services can log under the SAME correlation id.
     if (req.headers["x-request-id"]) {
       proxyReq.setHeader("x-request-id", req.headers["x-request-id"] as string);
+    }
+
+    // Set headers BEFORE piping the body. Once the request body starts
+    // streaming (below) the outbound headers are already flushed, and
+    // any later setHeader would throw ERR_HTTP_HEADERS_SENT.
+    // express.json() (earlier in the chain) already consumed the
+    // original request stream to populate req.body — so we need to
+    // manually re-write it onto the outgoing proxy request, otherwise
+    // the backend receives an empty body
+    if (req.body) {
+      fixRequestBody(proxyReq, req);
     }
   }
 

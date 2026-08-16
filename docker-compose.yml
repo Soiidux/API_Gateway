@@ -94,8 +94,11 @@ services:
       PORT: 3001
       INSTANCE_ID: 1
       JWT_SECRET: gateway_secret_is_super_secure
+      DATABASE_URL: postgres://gateway_user:gateway_secure_password@postgres:5432/gateway_db
     networks:
       - gateway_net
+    depends_on:
+      - postgres
 
   user-service-2:
     build: ./services/user-service
@@ -104,8 +107,11 @@ services:
       PORT: 3001
       INSTANCE_ID: 2
       JWT_SECRET: gateway_secret_is_super_secure
+      DATABASE_URL: postgres://gateway_user:gateway_secure_password@postgres:5432/gateway_db
     networks:
       - gateway_net
+    depends_on:
+      - postgres
 
   user-service-3:
     build: ./services/user-service
@@ -114,8 +120,11 @@ services:
       PORT: 3001
       INSTANCE_ID: 3
       JWT_SECRET: gateway_secret_is_super_secure
+      DATABASE_URL: postgres://gateway_user:gateway_secure_password@postgres:5432/gateway_db
     networks:
       - gateway_net
+    depends_on:
+      - postgres
 
 
   payment-service-1:
