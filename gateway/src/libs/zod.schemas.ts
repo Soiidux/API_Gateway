@@ -11,3 +11,7 @@ export const loginUserSchema = z.object({
   email: z.email(),
   password: z.string(),
 });
+
+export const paymentTxSchema = z.object({
+  amount: z.number().positive(),
+});

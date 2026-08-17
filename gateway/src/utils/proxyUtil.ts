@@ -59,9 +59,21 @@ class ProxyUtil {
       path: "/api/v1/payments",
       urls: config.PAYMENT_SERVICE_URLS,
       name: "payment-service",
-      defaultRoles: ["ADMIN"],             // EVERY route in this service requires ADMIN, unless overridden in roleMap
+      // Every non-roleMap route in this service just needs a valid JWT.
+      // NOTE: defaultRoles MUST be the full valid set — conditionalAuth
+      // treats a required-roles array of [] as "forbid everyone" (an empty
+      // list includes nothing), so omitting it here would 403 every caller.
+      defaultRoles: ["ADMIN", "MANAGER", "USER"],
+      roleMap: {
+        "/getAll": ["ADMIN", "MANAGER"],   // only these roles may list every account
+      },
+      bodySchemas: {
+        "/deposit": schema.paymentTxSchema, // validate the amount before forwarding
+        "/withdraw": schema.paymentTxSchema,
+      },
       cachebleRoutes: {
         "/getAll": { ttl: 15 * 60 * 1000 },
+        "/my": { ttl: 15 * 60 * 1000 },
       },
     },
   ];
