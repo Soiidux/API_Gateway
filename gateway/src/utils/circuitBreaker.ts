@@ -27,16 +27,19 @@ class CircuitBreaker {
 
   // failureThreshold + cooldownPeriod are fixed at construction; onStateChange is the
   // optional hook fired when the breaker trips OPEN or recovers to CLOSED (log event).
+  // `now` is an injectable clock (defaults to Date.now) so tests can step time
+  // deterministically instead of waiting on a real timer.
   constructor(
     private readonly failureThreshold: number = 5,
     private readonly cooldownPeriod: number = 30000,
     private readonly onStateChange?: (state: "OPEN" | "CLOSED") => void,
+    private readonly now: () => number = () => Date.now(),
   ) {
   }
 
   canRequest(): boolean {
     if (this.state === "OPEN") {
-      if(Date.now()>=this.nextAttempt) {
+      if(this.now()>=this.nextAttempt) {
         this.state = "HALF_OPEN";
         return true; // Cooldown elapsed — allow one trial request
       }
@@ -59,7 +62,7 @@ class CircuitBreaker {
     this.failureCount++;
     if (this.state === "HALF_OPEN" || this.failureCount >= this.failureThreshold) {
       this.state = "OPEN";
-      this.nextAttempt = Date.now() + this.cooldownPeriod;
+      this.nextAttempt = this.now() + this.cooldownPeriod;
       this.onStateChange?.("OPEN");
     }
   }

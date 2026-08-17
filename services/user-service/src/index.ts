@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type RequestHandler } from "express";
 import dotenv from "dotenv";
 import { getUsers, rateLimiterCheck, registerUser } from "./controllers/user.controllers.js";
 import { requireAuth } from "./middlewares/requireAuth.js";
@@ -57,8 +57,10 @@ async function main(): Promise<void> {
 
   // /getAll is role-restricted at the gateway (ADMIN/MANAGER) AND verified
   // again here via requireAuth — the service never trusts proxy headers.
-  app.get("/getAll", requireAuth, getUsers);
-  app.post("/register", registerUser);
+  // (as unknown as RequestHandler: controllers accept an injectable db arg
+  // for tests, which Express's handler typing doesn't know about.)
+  app.get("/getAll", requireAuth, getUsers as unknown as RequestHandler);
+  app.post("/register", registerUser as unknown as RequestHandler);
   app.get("/", rateLimiterCheck);
 
   app.listen(config.PORT, () => {

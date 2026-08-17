@@ -17,6 +17,10 @@ interface ApiResponse<T> {
 // created lazily so importing the module doesn't trigger a DB connection.
 const postgres = new PostgresClient();
 
+// Injectable seam for tests: handlers accept an optional db so a test can
+// substitute a fake instead of hitting Postgres. Defaults to the real one.
+type Database = typeof postgres.db;
+
 const VALID_ROLES = ["ADMIN", "MANAGER", "USER"] as const;
 
 /**
@@ -25,10 +29,10 @@ const VALID_ROLES = ["ADMIN", "MANAGER", "USER"] as const;
  * `password_hash` is never selected back out, so it can't leak in a
  * response. Only id/email/name/role/createdAt are exposed.
  */
-export const getUsers = async (req: Request, res: Response) => {
+export const getUsers = async (req: Request, res: Response, db: Database = postgres.db) => {
   console.log(`[User Service ${process.env.INSTANCE_ID}] Handled request on port ${config.PORT}`);
 
-  const rows = await postgres.db
+  const rows = await db
     .select({
       id: users.id,
       email: users.email,
@@ -58,7 +62,7 @@ export const getUsers = async (req: Request, res: Response) => {
  *  5. Success returns the JWT (as before) so the rest of the demo can
  *     use it against protected gateway routes.
  */
-export const registerUser = async (req: Request, res: Response) => {
+export const registerUser = async (req: Request, res: Response, db: Database = postgres.db) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const userId = typeof body.userId === "string" ? body.userId : undefined;
   const email = typeof body.email === "string" ? body.email : undefined;
@@ -89,7 +93,7 @@ export const registerUser = async (req: Request, res: Response) => {
   try {
     // Check BOTH business keys up front so a duplicate gets a clean 409
     // instead of crashing at insert time.
-    const existing = await postgres.db
+    const existing = await db
       .select({ id: users.id })
       .from(users)
       .where(eq(users.email, email));
@@ -108,7 +112,7 @@ export const registerUser = async (req: Request, res: Response) => {
     // — nearly free on modern hardware, very expensive to brute-force.
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    await postgres.db.insert(users).values({
+    await db.insert(users).values({
       id: userId,
       email,
       role: validRole,
