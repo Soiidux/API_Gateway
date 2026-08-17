@@ -8,8 +8,8 @@ const schema = z.object({
   email: z.email(),
 });
 
-function makeStubs() {
-  const req = { path: "/register", body: {} } as Request;
+function makeStubs(path = "/register") {
+  const req = { path, body: {} } as Request;
   const res = {
     status: vi.fn().mockReturnThis(),
     json: vi.fn().mockReturnThis(),
@@ -53,5 +53,30 @@ describe("validateBody", () => {
 
     expect(next).toHaveBeenCalledTimes(1);
     expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it("accepts a valid login body", async () => {
+    const { req, res, next } = makeStubs("/login");
+    req.body = { email: "u1@demo.com", password: "hunter2" };
+    const loginSchema = z.object({ email: z.email(), password: z.string() });
+
+    await validateBody({ "/login": loginSchema })(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.json).not.toHaveBeenCalled();
+  });
+
+  it("rejects a login body with a missing password", async () => {
+    const { req, res, next } = makeStubs("/login");
+    req.body = { email: "u1@demo.com" };
+    const loginSchema = z.object({ email: z.email(), password: z.string() });
+
+    await validateBody({ "/login": loginSchema })(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ success: false, status: 400 }),
+    );
   });
 });

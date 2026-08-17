@@ -1,6 +1,6 @@
-import express, { type RequestHandler } from "express";
+import express, { type Request, type RequestHandler, type Response } from "express";
 import dotenv from "dotenv";
-import { getUsers, rateLimiterCheck, registerUser } from "./controllers/user.controllers.js";
+import { getUsers, loginUser, rateLimiterCheck, registerUser } from "./controllers/user.controllers.js";
 import { requireAuth } from "./middlewares/requireAuth.js";
 import { PostgresClient } from "./db/client.js";
 import config from "./config.js";
@@ -59,8 +59,14 @@ async function main(): Promise<void> {
   // again here via requireAuth — the service never trusts proxy headers.
   // (as unknown as RequestHandler: controllers accept an injectable db arg
   // for tests, which Express's handler typing doesn't know about.)
-  app.get("/getAll", requireAuth, getUsers as unknown as RequestHandler);
-  app.post("/register", registerUser as unknown as RequestHandler);
+  //
+  // The controllers take (req, res, db = postgres.db) so tests can inject a
+  // fake db. Express would call them as (req, res, next) — handing `next`
+  // to the db param — so we mount thin wrappers that only forward req/res
+  // and let the default kick in.
+  app.get("/getAll", requireAuth, ((req: Request, res: Response) => getUsers(req, res)) as unknown as RequestHandler);
+  app.post("/register", ((req: Request, res: Response) => registerUser(req, res)) as unknown as RequestHandler);
+  app.post("/login", ((req: Request, res: Response) => loginUser(req, res)) as unknown as RequestHandler);
   app.get("/", rateLimiterCheck);
 
   app.listen(config.PORT, () => {

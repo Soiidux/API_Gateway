@@ -59,8 +59,7 @@ export const getUsers = async (req: Request, res: Response, db: Database = postg
  *  2. role is validated against the same enum the gateway enforces.
  *  3. password is bcrypt-hashed (never stored plaintext, never logged).
  *  4. Duplicate userId OR email -> 409 (unique constraints as backstop).
- *  5. Success returns the JWT (as before) so the rest of the demo can
- *     use it against protected gateway routes.
+ *  5. Success returns the created user (no token — /login mints those).
  */
 export const registerUser = async (req: Request, res: Response, db: Database = postgres.db) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
@@ -121,14 +120,11 @@ export const registerUser = async (req: Request, res: Response, db: Database = p
 
     console.log(`[User Service ${config.INSTANCE_ID}] Registered user ${userId} (${role})`);
 
-    // The register flow doubles as the token-issuance flow for this demo
-    // (there is deliberately no /login endpoint).
-    const token = jwt.sign({ userId, role: validRole }, config.JWT_SECRET, { expiresIn: "7d" });
-
-    const apiResponsePayload: ApiResponse<string> = {
+    // /register creates the account only — token issuance is /login's job.
+    const apiResponsePayload: ApiResponse<{ userId: string; email: string; role: string }> = {
       success: true,
       message: "User created successfully",
-      data: token,
+      data: { userId, email, role: validRole },
       status: 201,
     };
     return res.status(apiResponsePayload.status).json(apiResponsePayload);
@@ -154,4 +150,84 @@ export const rateLimiterCheck = (req: Request, res: Response) => {
     status: 200,
   };
   return res.status(resPayload.status).json(resPayload);
+};
+
+/**
+ * POST /login — the only token-issuance endpoint.
+ *
+ * Verifies the stored bcrypt hash (register only wrote it). The role in the
+ * token comes from the DB row, not the request body. Fails with a generic
+ * 401 so a caller can't tell whether the email or the password was wrong.
+ */
+export const loginUser = async (req: Request, res: Response, db: Database = postgres.db) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const email = typeof body.email === "string" ? body.email : undefined;
+  const password = typeof body.password === "string" ? body.password : undefined;
+
+  if (!email || !password) {
+    const badRequest: ApiResponse<null> = {
+      success: false,
+      message: "Missing required fields: email, password",
+      status: 400,
+      data: null,
+    };
+    return res.status(400).json(badRequest);
+  }
+
+  try {
+    const rows = await db
+      .select({
+        userId: users.id,
+        email: users.email,
+        role: users.role,
+        passwordHash: users.passwordHash,
+      })
+      .from(users)
+      .where(eq(users.email, email));
+
+    const row = rows[0];
+
+    // Same generic message whether the account doesn't exist or the
+    // password is wrong — don't leak which one failed.
+    const invalidCredentials: ApiResponse<null> = {
+      success: false,
+      message: "Invalid credentials",
+      status: 401,
+      data: null,
+    };
+
+    if (!row) {
+      return res.status(401).json(invalidCredentials);
+    }
+
+    const passwordMatches = await bcrypt.compare(password, row.passwordHash);
+    if (!passwordMatches) {
+      return res.status(401).json(invalidCredentials);
+    }
+
+    console.log(`[User Service ${config.INSTANCE_ID}] User ${row.userId} logged in (${row.role})`);
+
+    const token = jwt.sign(
+      { userId: row.userId, role: row.role },
+      config.JWT_SECRET,
+      { expiresIn: "7d" },
+    );
+
+    const apiResponsePayload: ApiResponse<{ token: string }> = {
+      success: true,
+      message: "Login successful",
+      data: { token },
+      status: 200,
+    };
+    return res.status(apiResponsePayload.status).json(apiResponsePayload);
+  } catch (error) {
+    console.error("[User Service] Login failed:", error);
+    const serverError: ApiResponse<null> = {
+      success: false,
+      message: "Login failed",
+      status: 503,
+      data: null,
+    };
+    return res.status(503).json(serverError);
+  }
 };

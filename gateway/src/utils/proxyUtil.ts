@@ -43,12 +43,13 @@ class ProxyUtil {
       urls: config.USER_SERVICE_URLS,      // list of instance URLs (round robin targets)
       name: "user-service",                // used as the key for this service's load balancer
       timeout: 5000,                       // how long to wait before giving up on a request
-      publicRoutes: ["/register","/"],         // no JWT required for these
+      publicRoutes: ["/register", "/login", "/"],         // no JWT required for these
       roleMap: {
         "/getAll": ["ADMIN", "MANAGER"],   // only these roles may call /getAll
       },
       bodySchemas: {
         "/register": schema.registerUserSchema, // validate request body against this schema
+        "/login": schema.loginUserSchema,
       },
       cachebleRoutes: {
         "/getAll": { ttl: 15 * 60 * 1000 },

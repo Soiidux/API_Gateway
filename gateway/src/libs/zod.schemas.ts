@@ -6,3 +6,8 @@ export const registerUserSchema = z.object({
   password: z.string(),
   role: z.enum(["ADMIN", "MANAGER","USER"])
 });
+
+export const loginUserSchema = z.object({
+  email: z.email(),
+  password: z.string(),
+});
