@@ -1,3 +1,6 @@
+# The API gateway: the single entry point (port 3000) that all HTTP
+# traffic hits. It validates JWT/RBAC, rate-limits, caches, and proxies
+# to the user/payment service replicas. Built from the compiled dist/.
 FROM node:20-alpine
 
 WORKDIR /app

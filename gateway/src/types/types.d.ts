@@ -1,3 +1,16 @@
+/**
+ * Global ambient types for the gateway.
+ *
+ * Declared with `declare global` so every file can use them without an
+ * import. These sit at the boundary between the routing config
+ * (proxyUtil) and the middleware that consumes it:
+ *
+ *  - ApiResponse<T>      : the standard response envelope produced by
+ *                          generateApiResponse and every backend
+ *  - Config              : the resolved env config (see config.ts)
+ *  - ServiceConfig       : one proxied service's routing table —
+ *                          path/urls/roles/bodySchemas/caching
+ */
 import { z } from "zod";
 
 declare global {

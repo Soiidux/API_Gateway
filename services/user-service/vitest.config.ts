@@ -1,3 +1,7 @@
+/**
+ * Vitest configuration for the user service package.
+ * Tests live next to the code (the *.test.ts files under src/).
+ */
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({

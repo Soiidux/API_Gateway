@@ -6,6 +6,26 @@ import { PostgresClient } from "../db/client.js";
 import { users } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 
+/**
+ * User service HTTP handlers.
+ *
+ * Register (POST /register): creates a user with a bcrypt-hashed password.
+ * NOTE — this is a deliberately simplified "demo auth" model: the client
+ * supplies the `role` directly (ADMIN/MANAGER/USER, validated by the
+ * gateway's zod schema), and no token is issued here. Self-assignment is
+ * acceptable for a portfolio/demo, not for production.
+ *
+ * Login (POST /login): verifies email + password hash, then mints the
+ * JWT (userId + role from the DB row) that the gateway forwards to
+ * backend services for identity. Responses are intentionally generic
+ * ("Invalid email or password") so the login endpoint can't be used to
+ * enumerate which emails exist.
+ *
+ * GetAll (GET /getAll): requires ADMIN/MANAGER — enforced BOTH by the
+ * gateway (RBAC) and re-checked here from the verified JWT via
+ * requireAuth, so the service is safe even when hit directly.
+ */
+
 interface ApiResponse<T> {
   success: boolean;
   message: string;

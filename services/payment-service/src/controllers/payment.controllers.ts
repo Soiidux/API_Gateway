@@ -5,6 +5,32 @@ import { PostgresClient } from "../db/client.js";
 import { accounts, transactions } from "../db/schema.js";
 dotenv.config();
 
+/**
+ * Payment service HTTP handlers.
+ *
+ * Identity always comes from `req.auth` — the verified JWT payload set
+ * by requireAuth middleware — never from a header or body. This service
+ * never trusts proxy-forwarded headers by itself.
+ *
+ *  - /deposit : atomically upserts into `accounts` (INSERT ... ON
+ *    CONFLICT +1) then records a transaction row. Safe against
+ *    concurrent deposits and a missing account.
+ *  - /withdraw: one atomic conditional UPDATE (`balance >= amount`),
+ *    returns 0 rows -> 422 "Insufficient Balance". Safe against
+ *    concurrent withdrawals racing on the same account.
+ *  - /my      : this caller's account + transaction history.
+ *  - /getAll  : all accounts; ADMIN/MANAGER only (re-checked here, like
+ *    user-service).
+ *
+ * (/ is a separate liveness / rate-limit probe — see rateLimiterCheck.)
+ *
+ * Every mutation performs two atomic statements: the balance movement
+ * (upsert / conditional UPDATE with RETURNING), then a ledger-row insert.
+ * NOTE: the two are NOT wrapped in one DB transaction — a partial failure
+ * could leave the balance and the ledger out of step. Wrapping them in a
+ * real transaction is a noted hardening step for production.
+ */
+
 interface ApiResponse<T> {
   success: boolean;
   message: string;

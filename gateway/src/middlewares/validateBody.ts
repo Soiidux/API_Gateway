@@ -1,3 +1,19 @@
+/**
+ * validateBody — zod body-validation middleware, applied per service route.
+ *
+ * Each proxied service declares a `bodySchemas` map (see proxyUtil) of
+ * `{ routePath: ZodSchema }`. When a request matches one of those routes
+ * its JSON body is validated with the corresponding schema BEFORE being
+ * forwarded:
+ *   - invalid body  -> 400 Bad Request (with the joined zod issues)
+ *   - valid body    -> req.body is replaced with the parsed/typed result
+ *   - no schema for this route -> passes straight through (e.g. GETs)
+ *
+ * zod's safeParseAsync never throws on malformed data, and the defensive
+ * catch below guards any unexpected error so a validator bug can never
+ * 500 a request — it falls back to letting the request through.
+ */
+
 import type { Request, Response, NextFunction } from "express";
 import { z, ZodError } from "zod";
 import generateApiResponse from "../utils/generateApiResponse.js";
