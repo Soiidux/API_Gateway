@@ -9,6 +9,7 @@ import {
 } from "./controllers/payment.controllers.js";
 import { requireAuth } from "./middlewares/requireAuth.js";
 import { PostgresClient } from "./db/client.js";
+import { Readiness } from "./health.js";
 import config from "./config.js";
 dotenv.config();
 
@@ -61,6 +62,13 @@ async function main(): Promise<void> {
   const app = express();
   app.use(express.json());
 
+  // Liveness + readiness, registered BEFORE the business routes so a health
+  // probe is never rejected by auth. Docker's HEALTHCHECK polls /ready; until
+  // it passes, Compose holds back anything that depends_on this service.
+  const readiness = new Readiness();
+  app.get("/health", readiness.liveness);
+  app.get("/ready", readiness.readiness);
+
   // Every money-touching route demands a service-side verified JWT; the
   // injected user identity comes from the token (req.auth), never from the
   // request body or a forwarded header. getMy/getAll are cached at the
@@ -76,9 +84,57 @@ async function main(): Promise<void> {
   app.get("/getAll", requireAuth, ((req: Request, res: Response) => getAll(req, res)) as unknown as RequestHandler);
   app.get("/", rateLimiterCheck);
 
-  app.listen(config.PORT, () => {
+  const server = app.listen(config.PORT, () => {
     console.log(`Payment Service ${config.INSTANCE_ID} running internally on port ${config.PORT}`);
   });
+
+  // Only now that accounts/transactions are guaranteed present do we accept
+  // traffic. Ordering matters: markReady() after ensurePaymentTables() means
+  // a replica can never report healthy and then fail its first real request.
+  readiness.markReady();
+
+  /**
+   * Graceful shutdown (mirrors the gateway and log-worker).
+   *
+   * On SIGTERM (docker stop / compose down / rolling restart) Docker allows
+   * roughly 10 seconds before SIGKILL. The sequence:
+   *   1. markDraining()  -> /ready starts returning 503, so the load
+   *      balancer (and Compose) stops routing new requests here.
+   *   2. server.close() -> stop accepting new connections and let in-flight
+   *      requests finish rather than severing them mid-response.
+   *   3. postgres.end() -> close the connection pool last, so no query is
+   *      cut off while draining.
+   *
+   * This matters more here than in user-service: cutting a connection
+   * mid-transaction is exactly the case that could leave a balance updated
+   * without its matching ledger row.
+   */
+  let shuttingDown = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Payment Service ${config.INSTANCE_ID}] ${signal} received, draining...`);
+    readiness.markDraining();
+
+    setTimeout(() => {
+      console.error("[Payment Service] Forced shutdown after timeout.");
+      process.exit(1);
+    }, 10_000).unref();
+
+    server.close(async () => {
+      try {
+        await postgres.end();
+        console.log("[Payment Service] Shutdown complete.");
+        process.exit(0);
+      } catch (error) {
+        console.error("[Payment Service] Error during shutdown:", error);
+        process.exit(1);
+      }
+    });
+  };
+
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 }
 
 main().catch((error) => {

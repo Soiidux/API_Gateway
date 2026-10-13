@@ -2,16 +2,17 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import proxyServices from "./utils/proxyUtil.js";
+import { Readiness } from "./health.js";
 
 /**
  * Gateway entry point.
  *
  * Middleware order matters: CORS (browser access policy) → helmet
  * (security headers) → express.json (parse bodies before anything reads
- * them; the proxy re-injects them downstream) → proxyServices(app) which
- * registers every /api/v1 route and its middleware chain (see
- * utils/proxyUtil.ts). A final error handler is the last safety net for
- * anything that throws.
+ * them; the proxy re-injects them downstream) → health routes →
+ * proxyServices(app) which registers every /api/v1 route and its
+ * middleware chain (see utils/proxyUtil.ts). A final error handler is the
+ * last safety net for anything that throws.
  */
 const app = express();
 app.use(cors({
@@ -23,6 +24,13 @@ app.use(helmet());
 
 
 app.use(express.json());
+
+// Liveness + readiness. Registered before the proxy routes so a probe is
+// never swallowed by the /api/v1 middleware chain. Docker's HEALTHCHECK
+// polls /ready; Compose's depends_on: service_healthy waits on it.
+const readiness = new Readiness();
+app.get("/health", readiness.liveness);
+app.get("/ready", readiness.readiness);
 
 proxyServices(app);
 
@@ -53,8 +61,15 @@ const server = app.listen(3000, () => {
   console.log("[Proxy] Gateway is running on port 3000");
 });
 
+// The gateway owns no schema, so it is ready as soon as it's listening.
+readiness.markReady();
+
 async function shutdown(signal: string): Promise<void> {
   console.log(`[Proxy] ${signal} received, shutting down gracefully...`);
+
+  // Stop advertising as ready first, so nothing new is routed here while we
+  // drain what's already in flight.
+  readiness.markDraining();
 
   // Stop accepting new connections, then finish what's in-flight.
   server.close(() => {
