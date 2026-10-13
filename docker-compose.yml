@@ -23,6 +23,17 @@ services:
     networks:
       - gateway_net
     restart: always
+    # Liveness only: pg_isready succeeds as soon as the server accepts
+    # connections, which can be BEFORE the first-boot database is actually
+    # created. The services gate on their own /ready (post-migration), so this
+    # check doesn't need to be stricter — it's here so dependent containers
+    # don't race Postgres coming up at all.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway_user} -d ${POSTGRES_DB:-gateway_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
@@ -34,6 +45,11 @@ services:
     networks:
       - gateway_net
     restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   rabbitmq:
     image: rabbitmq:3-management-alpine
@@ -49,6 +65,15 @@ services:
     networks:
       - gateway_net
     restart: always
+    # `rabbitmq-diagnostics` is the supported readiness probe and confirms the
+    # node is actually accepting AMQP traffic (not merely that the process is
+    # up, which is true well before the vhost is ready).
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   gateway:
     build: ./gateway
@@ -64,10 +89,16 @@ services:
       - "3000:3000"
     networks:
       - gateway_net
+    # service_healthy (not the short-list form) so the gateway only starts once
+    # Postgres/Redis/RabbitMQ are genuinely accepting traffic — the short form
+    # only waits for containers to *start*.
     depends_on:
-      - postgres
-      - redis
-      - rabbitmq
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
   log-worker:
     # The CONSUMER: pulls messages off the "api_gateway_logs" queue and
@@ -83,8 +114,10 @@ services:
     networks:
       - gateway_net
     depends_on:
-      - postgres
-      - rabbitmq
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     restart: always
 
   user-service-1:
@@ -98,7 +131,8 @@ services:
     networks:
       - gateway_net
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
   user-service-2:
     build: ./services/user-service
@@ -111,7 +145,8 @@ services:
     networks:
       - gateway_net
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
   user-service-3:
     build: ./services/user-service
@@ -124,7 +159,8 @@ services:
     networks:
       - gateway_net
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
 
   payment-service-1:
@@ -138,7 +174,8 @@ services:
     networks:
       - gateway_net
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
   payment-service-2:
     build: ./services/payment-service
@@ -151,7 +188,8 @@ services:
     networks:
       - gateway_net
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
   payment-service-3:
     build: ./services/payment-service
@@ -164,7 +202,8 @@ services:
     networks:
       - gateway_net
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
   
 
 networks:
