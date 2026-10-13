@@ -62,11 +62,13 @@ log consumer.
 .
 ├── docker-compose.yml          # the whole system: 5 infra/service kinds, replicas
 ├── .env.example                # all configurable secrets/URLs (copy to .env)
+├── .github/workflows/ci.yml   # CI: matrix test + docker build + e2e smoke test
 ├── gateway/                    # the API Gateway (port 3000)
-│   ├── Dockerfile
+│   ├── Dockerfile              # multi-stage, non-root, HEALTHCHECK
 │   └── src/
 │       ├── config.ts           # env → typed runtime config
-│       ├── index.ts            # express bootstrap: cors → helmet → json → proxy
+│       ├── index.ts            # express bootstrap: cors → helmet → json → health → proxy
+│       ├── health.ts           # liveness (/health) vs readiness (/ready)
 │       ├── libs/zod.schemas.ts # shared request-body schemas
 │       ├── db/redisClient.ts   # shared ioredis connection
 │       ├── types/              # ambient types: ApiResponse<T>, Config, ServiceConfig, req.* fields
@@ -96,21 +98,37 @@ log consumer.
 
 ## Quick Start
 
+> **A note on npm versions.** Each package has its own `package-lock.json`, and those
+> lockfiles are generated with **npm 10** (the version bundled in `node:20-alpine`).
+> npm 10 and npm 12 disagree about optional platform-specific packages such as esbuild,
+> so a lockfile written by npm 12 is rejected by `npm ci` inside the image with a
+> confusing "out of sync" error. If you ever regenerate one, use npm 10 — e.g.
+> `docker run --rm -v "$PWD/services/user-service:/w" -w /w node:20-alpine npm install --package-lock-only`.
+> Running a newer npm's `npm install` locally will silently rewrite the lockfile in a form
+> the Docker build rejects.
+
 ```bash
 # 1. (optional) configure secrets/URLs — defaults in .env.example work out of the box
 cp .env.example .env
 
 # 2. build all images and start the whole stack
-docker compose up --build -d
+docker compose up --build -d              # add --wait to block until all healthy
 
 # 3. watch everything come up
 docker compose ps
 docker compose logs -f gateway            # or user-service-1, payment-service-1, log-worker
 ```
 
+`--wait` blocks until every container reports **healthy**, so the stack is only usable once
+each replica has finished (or confirmed) its migrations:
+
+```bash
+docker compose up --build -d --wait --wait-timeout 300
+```
+
 The first `payment-service-1` / `user-service-1` boot applies the schema migrations
 (only `INSTANCE_ID=1` runs DDL — see [Database](#database)); every other replica waits
-until the tables exist, so a warm start never races.
+until the tables exist, and no replica reports ready until its table is there.
 
 > **Local httpbin-style check of the whole pipeline:** hit the gateway, then query the log
 > consumer's output — every request you make ends up as a row in `gateway_db.logs`:
@@ -141,6 +159,7 @@ zero configuration. Override any of them in `.env`.
 | `INSTANCE_ID` | services | 1–3 | replica id; `1` owns the migration |
 | `RETENTION_DAYS` | log-worker | `30` | delete log rows older than this, at boot + every interval |
 | `RETENTION_INTERVAL_HOURS` | log-worker | `6` | how often the retention cleanup re-runs |
+| `NODE_ENV` | all images | `production` | set in the runtime stage; enables npm's production behaviour |
 
 ---
 
@@ -333,6 +352,17 @@ Three tables owned by three owners, all living in **one** Postgres database (`ga
 Each service generates and owns **its own** versioned migrations (`drizzle/` folders); a
 service only ever runs DDL for its own tables.
 
+**Each service also gets its own migration ledger.** Drizzle records what it has applied in a
+table (default `__drizzle_migrations` in schema `drizzle`) and skips any migration whose
+journal timestamp is *older* than the newest one it has recorded. With one shared database
+that default is shared too, so whichever service migrated first would "claim" the ledger and
+the other services' older migrations would be **silently skipped** — their tables would never
+be created. This actually happened here: log-worker's journal was generated earliest, so a
+user-service-first boot made log-worker report "Migrations applied" while the `logs` table
+never existed. Each service now names its own ledger (`user_service_migrations`,
+`payment_service_migrations`, `log_worker_migrations`), so boot order between services no
+longer matters.
+
 | Table | Owner | Notes |
 |---|---|---|
 | `users` | user-service | `id` PK, `email` unique, `password_hash`, `role` |
@@ -356,20 +386,72 @@ drizzle-kit push      # (dev-only shortcut)
 
 ---
 
+## Health, readiness & graceful shutdown
+
+Every HTTP service exposes two endpoints, and the distinction matters in containers:
+
+| Endpoint | Meaning | 200 when |
+|---|---|---|
+| `/health` | **liveness** — "is this process alive?" | the event loop can answer at all |
+| `/ready`  | **readiness** — "send me traffic?" | migrations are done **and** not draining |
+
+Neither probes the database. A dead database shouldn't get a container *restarted* (that
+would just restart the wait); it should show up as a failing readiness check instead.
+
+The ready flag is set **after** `ensureUsersTable()` / `ensurePaymentTables()` resolves, never
+at `listen()` time — otherwise a replica could report healthy and then 500 on its first real
+request because the table wasn't there yet. `markDraining()` flips `/ready` to 503 the moment
+SIGTERM arrives, so nothing new is routed while in-flight requests finish.
+
+This is what makes Compose's gating meaningful: `depends_on: service_healthy` waits on
+`/ready`, so a replica is never handed traffic before it can answer it. Every service drains
+in order — stop advertising ready → `server.close()` to finish in-flight work → close the
+connection pool last — with a 10-second force-exit so a hung request can't outlive Docker's
+kill window. `log-worker` has no HTTP surface, so its healthcheck is a process check (a
+deliberately shallow check, noted as such in its Dockerfile).
+
+## Container hardening
+
+All four images are multi-stage: a builder stage with the full toolchain compiles TypeScript,
+and a runtime stage gets production-only `node_modules` + `dist/` and nothing else. Each runs
+as `USER node` (a built-in non-root user in the official image). `CMD` uses the exec form so
+PID 1 is `node` itself and SIGTERM reaches the shutdown handler directly rather than being
+swallowed by an npm wrapper.
+
+The three services copy their `drizzle/` folder into the runtime image — **not optional**:
+`runMigrations()` reads `./drizzle` at boot, so without it the service crashes before serving
+anything. The gateway ships no migrations, so it doesn't.
+
 ## Testing
 
-69 unit tests across 4 packages (Vitest; DB/Redis/RabbitMQ are never needed — tests inject
+74 unit tests across 4 packages (Vitest; DB/Redis/RabbitMQ are never needed — tests inject
 fakes through the handlers' dependency seams).
 
 ```bash
 (cd gateway && npm test)                    # 28 tests — middleware, balancer, breaker, cache, auth
+(cd gateway && npm test -- --coverage)      # opt into coverage (off by default)
 (cd services/user-service && npm test)      # 16 tests — register / login handlers
-(cd services/payment-service && npm test)   # 17 tests — deposit / withdraw / my / getAll / requireAuth
+(cd services/payment-service && npm test)   # 22 tests — deposit / withdraw / my / getAll / requireAuth / transactions
 (cd services/log-worker && npm test)        #  8 tests — batch buffer, retention cleanup
 
 # build check (tsc) — same pattern per package:
 (cd gateway && npm run build)
 ```
+
+### CI
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`:
+
+1. **`test`** — a matrix over all four packages (`npm ci` → `build` → `test`), `fail-fast: false`
+   so one broken package doesn't hide the state of the others.
+2. **`docker`** — `docker compose build`, which catches broken Dockerfiles that no amount of
+   npm testing would.
+3. **`e2e`** — brings the whole stack up with `--wait`, then proves it works: register → login →
+   deposit → a 422 over-withdrawal → an RBAC 403 → and that log rows actually reached Postgres.
+   Container logs are dumped on failure.
+
+No lint step: there is no ESLint or Prettier configured in this repo, so CI checks types,
+tests, images, and behaviour rather than style.
 
 ---
 
@@ -389,11 +471,21 @@ Deliberate simplifications (all annotated in code), good to bring up in an inter
 5. **Caching is per-user** for privacy; a coarser TTL/shared cache would trade privacy for
    fewer backend hits.
 6. **Rate limits are modest** (anon 2 req/s, authed 20 req/s) — tune via the instances file.
+7. **No idempotency keys.** Each payment mutation now runs its balance change and its ledger
+   row in a single `db.transaction()`, so a crash *inside the database* can't leave them out
+   of step. That does **not** protect against a client whose request times out and retries —
+   the same deposit would be applied twice. Real payment systems take a client-supplied unique
+   id, record it with the transaction, and treat a repeat as a no-op. Deliberately out of scope;
+   the transaction closes the crash case, the idempotency key closes the retry case.
+8. **Secrets are in compose**, not a secret manager. Fine for a demo, but `JWT_SECRET` and the
+   DB password are plaintext in the compose file — a real deployment would use Docker secrets
+   or a vault, and at minimum refuse to boot on a default secret outside dev.
 
-Not yet done (natural next steps, called out as outstanding work):
-- **README/CI**: this README; a GitHub Actions workflow (lint + test + build for all 4
-  packages, `docker compose build`) would be the natural CI step.
-- **Dockerfile hardening**: images run as `root` today and have **no healthchecks**;
-  multi-stage builds would slim them significantly.
-- **Graceful shutdown / observability** (Prometheus metrics, trace correlation) if the
-  project grows.
+Not yet done (natural next steps):
+- **Observability**: no metrics endpoint (Prometheus), no tracing. Cache hit rate, rate-limit
+  rejections, and breaker state are all computed but not exported.
+- **Linting/formatting**: there is no ESLint or Prettier configured, so CI checks
+  types + tests + builds but not style.
+- **Integration tests**: the CI e2e job covers the happy path and two error paths against real
+  containers; there's no automated concurrency test for the atomic deposit/withdraw guards,
+  which is where a race would actually bite.
