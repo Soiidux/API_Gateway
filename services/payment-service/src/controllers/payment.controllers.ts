@@ -24,11 +24,11 @@ dotenv.config();
  *
  * (/ is a separate liveness / rate-limit probe — see rateLimiterCheck.)
  *
- * Every mutation performs two atomic statements: the balance movement
- * (upsert / conditional UPDATE with RETURNING), then a ledger-row insert.
- * NOTE: the two are NOT wrapped in one DB transaction — a partial failure
- * could leave the balance and the ledger out of step. Wrapping them in a
- * real transaction is a noted hardening step for production.
+ * Every mutation runs the balance movement AND its ledger row inside a
+ * single db.transaction(), so a failure part-way can't move money without
+ * recording it. Known remaining gap: this protects against a crash inside
+ * the database, not against a client retrying a timed-out request, which
+ * needs idempotency keys (see the comment on deposit).
  */
 
 interface ApiResponse<T> {
@@ -107,25 +107,41 @@ export const deposit = async (req: Request, res: Response, db: Database = postgr
       return res.status(404).json(notFound);
     }
 
-    // Atomic upsert: one statement creates the account on first deposit or
-    // bumps the existing balance — INSERT ... ON CONFLICT. The database
-    // serializes the increment, so concurrent deposits can't lose money.
-    const accountResult = (await db.execute(
-      sql`INSERT INTO "accounts" ("user_id", "balance")
-          VALUES (${userId}, ${String(amount)})
-          ON CONFLICT ("user_id")
-          DO UPDATE SET "balance" = "accounts"."balance" + ${String(amount)}
-          RETURNING "balance"`,
-    )) as { rows: { balance: string }[] };
+    // Balance movement + ledger row in ONE transaction.
+    //
+    // The upsert statement is itself atomic (the database serializes the
+    // increment, so concurrent deposits can't lose each other's money) —
+    // but on its own it only guarantees the BALANCE is right. If the ledger
+    // insert then failed (connection drop, disk error), the money would have
+    // moved with no record of why. Wrapping both in db.transaction() means
+    // Postgres commits them together or rolls back both.
+    //
+    // Still not sufficient for production: this protects against a crash
+    // INSIDE the database, not against a client that times out and retries,
+    // which would apply the same deposit twice. That needs an idempotency
+    // key (client-supplied unique id recorded with the transaction, and a
+    // retry treated as a no-op) — a larger feature, deliberately out of
+    // scope here.
+    const balance = await db.transaction(async (tx) => {
+      const accountResult = (await tx.execute(
+        sql`INSERT INTO "accounts" ("user_id", "balance")
+            VALUES (${userId}, ${String(amount)})
+            ON CONFLICT ("user_id")
+            DO UPDATE SET "balance" = "accounts"."balance" + ${String(amount)}
+            RETURNING "balance"`,
+      )) as { rows: { balance: string }[] };
 
-    await db
-      .insert(transactions)
-      .values({ userId, type: "DEPOSIT", amount: String(amount) });
+      await tx
+        .insert(transactions)
+        .values({ userId, type: "DEPOSIT", amount: String(amount) });
+
+      return accountResult.rows[0]?.balance ?? "0";
+    });
 
     const apiResponsePayload: ApiResponse<{ userId: string; balance: number }> = {
       success: true,
       message: "Deposit successful",
-      data: { userId, balance: toNumber(accountResult.rows[0]?.balance) },
+      data: { userId, balance: toNumber(balance) },
       status: 201,
     };
     return res.status(apiResponsePayload.status).json(apiResponsePayload);
@@ -188,19 +204,39 @@ export const withdraw = async (req: Request, res: Response, db: Database = postg
       return res.status(404).json(notFound);
     }
 
-    // Atomic guard: a single conditional UPDATE ... WHERE balance >= amount.
-    // The database enforces the check inside the statement, so two concurrent
-    // withdraws can never both pass against the same funds. rowCount 0 means
-    // the balance couldn't cover it (or there's no account yet) → 422.
-    const accountResult = (await db.execute(
-      sql`UPDATE "accounts"
-          SET "balance" = "accounts"."balance" - ${String(amount)}
-          WHERE "user_id" = ${userId}
-            AND "balance" >= ${String(amount)}
-          RETURNING "balance"`,
-    )) as { rows: { balance: string }[] };
+    // Debit + ledger row in ONE transaction.
+    //
+    // The conditional UPDATE is itself the concurrency guard: the balance
+    // check and the subtraction happen inside a single statement, so two
+    // concurrent withdraws can never both pass against the same funds.
+    // Wrapping it together with the ledger insert means a failure part-way
+    // can't debit without recording why.
+    //
+    // Insufficient funds is signalled by returning null from inside the
+    // transaction rather than by sending the response here — the transaction
+    // simply commits having changed nothing, and we map null -> 422 after it
+    // closes. Writing the response inside would be fine too, but keeping the
+    // HTTP layer outside means a rollback can't race a half-written body.
+    const newBalance = await db.transaction(async (tx) => {
+      const accountResult = (await tx.execute(
+        sql`UPDATE "accounts"
+            SET "balance" = "accounts"."balance" - ${String(amount)}
+            WHERE "user_id" = ${userId}
+              AND "balance" >= ${String(amount)}
+            RETURNING "balance"`,
+      )) as { rows: { balance: string }[] };
 
-    if (accountResult.rows.length === 0) {
+      // 0 rows updated = balance couldn't cover it (or no account yet).
+      if (accountResult.rows.length === 0) return null;
+
+      await tx
+        .insert(transactions)
+        .values({ userId, type: "WITHDRAW", amount: String(amount) });
+
+      return accountResult.rows[0]!.balance;
+    });
+
+    if (newBalance === null) {
       const insufficient: ApiResponse<null> = {
         success: false,
         message: "Insufficient balance",
@@ -209,14 +245,6 @@ export const withdraw = async (req: Request, res: Response, db: Database = postg
       };
       return res.status(422).json(insufficient);
     }
-
-    // rows[0] is safe here: the 422 branch above already returned when
-    // the array was empty, so we only reach this line with a row in hand.
-    const newBalance = accountResult.rows[0]!.balance;
-
-    await db
-      .insert(transactions)
-      .values({ userId, type: "WITHDRAW", amount: String(amount) });
 
     const apiResponsePayload: ApiResponse<{ userId: string; balance: number }> = {
       success: true,
