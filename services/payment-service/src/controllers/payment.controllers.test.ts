@@ -10,8 +10,13 @@ function makeRes() {
   return res as unknown as Response & { status: ReturnType<typeof vi.fn>; json: ReturnType<typeof vi.fn> };
 }
 
-function makeReq(body: unknown, auth?: { userId: string; role: string }) {
-  const req = { body, auth };
+function makeReq(
+  body: unknown,
+  auth?: { userId: string; role: string },
+  query: Record<string, unknown> = {},
+) {
+  // `query` defaults to {} because getMy/getAll read ?limit/?offset.
+  const req = { body, auth, query };
   return req as unknown as Request & { auth?: { userId: string; role: string } };
 }
 
@@ -177,21 +182,48 @@ describe("withdraw", () => {
 /** Stubs db.select(...).from(...) so where() resolves to an (empty) array
  *  that also chains .orderBy(rows) — matches how getMy destructures the
  *  accounts row ([acc]) and calls orderBy on the transactions query. */
-function stubSelect(db: ReturnType<typeof makeDb>, rows: unknown[]) {
-  const where = vi.fn().mockImplementation(() => {
-    const result: unknown[] & { orderBy?: ReturnType<typeof vi.fn> } = [];
-    result.orderBy = vi.fn().mockResolvedValue(rows);
-    return result;
-  });
-  db.select = vi.fn().mockReturnValue({
-    from: vi.fn().mockReturnValue({ where }),
+/**
+ * Stub for the read paths of getMy/getAll, both of which are now PAGINATED.
+ *
+ * Rather than counting select() calls (fragile: getMy issues three selects in
+ * a different order than getAll), this dispatches on the SELECTION OBJECT —
+ * the controllers ask for `{ count: ... }` for totals, which makes the intent
+ * unambiguous:
+ *
+ *   getMy:   select({balance}).from().where()          -> awaited as [acc]
+ *            select({txn fields}).from().where()
+ *                      .orderBy().limit().offset()      -> transaction page
+ *            select({count}).from().where()             -> awaited as [countRow]
+ *
+ *   getAll:  select({all}).from().limit().offset()      -> account page
+ *            select({count}).from()                     -> awaited as [countRow]
+ *
+ * Each intermediate is a real array carrying the next chain method as a
+ * property, so `await` yields an array while `.orderBy()` still chains.
+ */
+function stubSelect(db: ReturnType<typeof makeDb>, rows: unknown[], total = rows.length) {
+  /** Build a chain node exposing every continuation any caller might use. */
+  const node = (value: unknown[]) => {
+    const n = value as unknown[] & Record<string, unknown>;
+    n.where = vi.fn().mockReturnValue(n);
+    n.orderBy = vi.fn().mockReturnValue(n);
+    n.limit = vi.fn().mockReturnValue(n);
+    n.offset = vi.fn().mockResolvedValue(value);
+    return n;
+  };
+
+  db.select = vi.fn().mockImplementation((fields?: Record<string, unknown>) => {
+    const isCount = fields !== undefined && "count" in fields;
+    return {
+      from: vi.fn().mockReturnValue(isCount ? node([{ count: total }]) : node(rows)),
+    };
   }) as never;
 }
 
 describe("getMy", () => {
-  it("returns the caller's balance and transactions", async () => {
+  it("returns the caller's balance and paginated transactions", async () => {
     const db = makeDb();
-    stubSelect(db, [{ id: "t1", type: "DEPOSIT", amount: "50.00", createdAt: new Date() }]);
+    stubSelect(db, [{ id: "t1", type: "DEPOSIT", amount: "50.00", createdAt: new Date() }], 1);
 
     const res = makeRes();
     await getMy(makeReq({}, { userId: "u1", role: "USER" }), res, db as never);
@@ -199,8 +231,42 @@ describe("getMy", () => {
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ balance: 0, transactions: expect.any(Array) }),
+        data: expect.objectContaining({
+          balance: 0,
+          transactions: expect.any(Array),
+          pagination: { limit: 50, offset: 0, total: 1 },
+        }),
       }),
+    );
+  });
+
+  it("honours ?limit / ?offset on the transaction history and clamps limit to 200", async () => {
+    const db = makeDb();
+    stubSelect(db, [], 0);
+    const res = makeRes();
+
+    await getMy(makeReq({}, { userId: "u1", role: "USER" }, { limit: "25", offset: "50" }), res, db as never);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ pagination: { limit: 25, offset: 50, total: 0 } }) }),
+    );
+
+    const res2 = makeRes();
+    await getMy(makeReq({}, { userId: "u1", role: "USER" }, { limit: "100000" }), res2, db as never);
+    expect(res2.json).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ pagination: expect.objectContaining({ limit: 200 }) }) }),
+    );
+  });
+
+  it("falls back to defaults for a malformed ?limit instead of erroring", async () => {
+    const db = makeDb();
+    stubSelect(db, [], 0);
+    const res = makeRes();
+
+    await getMy(makeReq({}, { userId: "u1", role: "USER" }, { limit: "abc", offset: "-1" }), res, db as never);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ pagination: { limit: 50, offset: 0, total: 0 } }) }),
     );
   });
 });
@@ -213,26 +279,46 @@ describe("getAll", () => {
     expect(res.status).toHaveBeenCalledWith(403);
   });
 
-  it("returns all accounts for an ADMIN", async () => {
+  it("returns all accounts for an ADMIN, paginated", async () => {
     const db = makeDb();
-    db.select = vi.fn().mockReturnValue({
-      from: vi.fn().mockResolvedValue([
-        { userId: "u1", balance: "100.00" },
-        { userId: "u2", balance: "25.50" },
-      ]),
-    }) as never;
+    stubSelect(db, [
+      { userId: "u1", balance: "100.00" },
+      { userId: "u2", balance: "25.50" },
+    ], 2);
 
     const res = makeRes();
     await getAll(makeReq({}, { userId: "admin", role: "ADMIN" }), res, db as never);
 
     expect(res.status).toHaveBeenCalledWith(200);
+    // Response shape changed: the list moved under data.accounts so that
+    // data.pagination could be added without a later breaking change.
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: [
-          { userId: "u1", balance: 100 },
-          { userId: "u2", balance: 25.5 },
-        ],
+        data: {
+          accounts: [
+            { userId: "u1", balance: 100 },
+            { userId: "u2", balance: 25.5 },
+          ],
+          pagination: { limit: 50, offset: 0, total: 2 },
+        },
       }),
+    );
+  });
+
+  it("honours ?limit and ?offset and clamps an oversized limit to 200", async () => {
+    const db = makeDb();
+    stubSelect(db, [], 0);
+    const res = makeRes();
+
+    await getAll(makeReq({}, { userId: "admin", role: "ADMIN" }, { limit: "5", offset: "10" }), res, db as never);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ pagination: { limit: 5, offset: 10, total: 0 } }) }),
+    );
+
+    const res2 = makeRes();
+    await getAll(makeReq({}, { userId: "admin", role: "ADMIN" }, { limit: "99999" }), res2, db as never);
+    expect(res2.json).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ pagination: expect.objectContaining({ limit: 200 }) }) }),
     );
   });
 });

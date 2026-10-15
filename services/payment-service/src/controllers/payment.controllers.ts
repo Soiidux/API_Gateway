@@ -57,6 +57,27 @@ function toNumber(value: string | number | null | undefined): number {
   return Number(value ?? 0);
 }
 
+/** Pagination defaults/limits for list endpoints. */
+const PAGE_SIZE_DEFAULT = 50;
+const PAGE_SIZE_MAX = 200;
+
+/**
+ * Parses a non-negative-integer query param (limit/offset), clamping limit
+ * to PAGE_SIZE_MAX and falling back to `fallback` for anything absent or
+ * unparseable. Deliberately forgiving: a malformed `?limit=abc` yields the
+ * default page rather than a 400, because a client with a bad page param
+ * still deserves to see data rather than an error.
+ *
+ * Always returns a number (never undefined) so callers don't have to narrow
+ * it before passing to Drizzle's limit()/offset(), which reject undefined.
+ */
+function parseLimit(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.min(Math.floor(parsed), PAGE_SIZE_MAX);
+}
+
 /**
  * POST /deposit { amount } — credit the caller's account.
  *
@@ -278,6 +299,22 @@ export const getMy = async (req: Request, res: Response, db: Database = postgres
       .from(accounts)
       .where(eq(accounts.userId, userId ?? ""));
 
+    // PAGINATED. This used to select the user's ENTIRE transaction history on
+    // every call, which grows without bound — a user with 10k transactions
+    // made this endpoint return 10k rows, every time, forever. Two problems:
+    // unbounded memory/latency in this process, and an unbounded response the
+    // gateway would then have to proxy.
+    //
+    // Now LIMIT/OFFSET with a hard cap: `?limit=` (default 50, max 200) and
+    // `?offset=`. Capped rather than merely defaulted so a client asking for
+    // limit=100000 gets 200 rather than the whole table.
+    //
+    // `newest first` ordering pairs with offset pagination, which is what a
+    // "recent activity" view wants; the index on (user_id, created_at) makes
+    // the ORDER BY + LIMIT cheap instead of a full sort per call.
+    const limit = parseLimit(req.query.limit, PAGE_SIZE_DEFAULT);
+    const offset = parseLimit(req.query.offset, 0);
+
     const txns = await db
       .select({
         id: transactions.id,
@@ -287,12 +324,30 @@ export const getMy = async (req: Request, res: Response, db: Database = postgres
       })
       .from(transactions)
       .where(eq(transactions.userId, userId ?? ""))
-      .orderBy(sql`${transactions.createdAt} desc`);
+      .orderBy(sql`${transactions.createdAt} desc`)
+      .limit(limit)
+      .offset(offset);
 
-    const apiResponsePayload: ApiResponse<{ balance: number; transactions: typeof txns }> = {
+    // Total row count for the client to compute "page 2 of N". A separate
+    // cheap COUNT query rather than inferring from the page size, which
+    // can't distinguish "exactly one more page" from "many more".
+    const [countRow] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(transactions)
+      .where(eq(transactions.userId, userId ?? ""));
+
+    const apiResponsePayload: ApiResponse<{
+      balance: number;
+      transactions: typeof txns;
+      pagination: { limit: number; offset: number; total: number };
+    }> = {
       success: true,
       message: "Account fetched successfully",
-      data: { balance: toNumber(acc?.balance), transactions: txns },
+      data: {
+        balance: toNumber(acc?.balance),
+        transactions: txns,
+        pagination: { limit, offset, total: Number(countRow?.count ?? 0) },
+      },
       status: 200,
     };
     return res.status(apiResponsePayload.status).json(apiResponsePayload);
@@ -327,13 +382,27 @@ export const getAll = async (req: Request, res: Response, db: Database = postgre
   }
 
   try {
-    const rows = await db.select().from(accounts);
+    // PAGINATED for the same reason as /my's history: this was an unbounded
+    // SELECT * over every account, so response size scaled with total users.
+    const limit = parseLimit(req.query.limit, PAGE_SIZE_DEFAULT);
+    const offset = parseLimit(req.query.offset, 0);
+
+    const rows = await db.select().from(accounts).limit(limit).offset(offset);
     const data = rows.map((r) => ({ userId: r.userId, balance: toNumber(r.balance) }));
 
-    const apiResponsePayload: ApiResponse<typeof data> = {
+    const [countRow] = await db.select({ count: sql<number>`count(*)` }).from(accounts);
+
+    const apiResponsePayload: ApiResponse<{
+      accounts: typeof data;
+      pagination: { limit: number; offset: number; total: number };
+    }> = {
       success: true,
       message: "Accounts fetched successfully",
-      data,
+      // Response shape CHANGED: the account list moved under `data.accounts`
+      // to make room for `data.pagination`. The old shape was a bare array,
+      // which left no room to add pagination without a breaking change —
+      // making the break explicit now rather than later.
+      data: { accounts: data, pagination: { limit, offset, total: Number(countRow?.count ?? 0) } },
       status: 200,
     };
     return res.status(apiResponsePayload.status).json(apiResponsePayload);
