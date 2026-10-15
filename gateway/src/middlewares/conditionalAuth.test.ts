@@ -93,4 +93,77 @@ describe("conditionalAuth", () => {
 
     expect(res.status).toHaveBeenCalledWith(403);
   });
+
+  /**
+   * Header-stripping (security regression tests).
+   *
+   * These headers are set FROM a verified JWT and are trusted downstream by
+   * rateLimitMiddleware (which picks its bucket from `x-user-id`) and
+   * cacheKey (which scopes cached responses by it). HTTP headers are
+   * caller-controlled, so a forged `x-user-id` arriving on a PUBLIC route —
+   * where this middleware returns early, before it would overwrite anything —
+   * used to make an anonymous request look authenticated. That handed the
+   * attacker the 20-token bucket instead of the 2-token one, and rotating the
+   * header per request got a fresh bucket every time: unlimited throughput
+   * against endpoints that bcrypt-hash passwords.
+   *
+   * The fix is to delete both headers unconditionally before any branching.
+   * These tests pin that behaviour so it can't regress silently.
+   */
+  describe("strips caller-supplied identity headers", () => {
+    it("removes forged x-user-id / x-user-role on a PUBLIC route", () => {
+      const { req, res, next, headers } = makeStubs("/register");
+      headers["x-user-id"] = "forged-id";
+      headers["x-user-role"] = "ADMIN";
+
+      conditionalAuth(["/register"])(req, res, next);
+
+      // Route is public, so no token is required...
+      expect(next).toHaveBeenCalledTimes(1);
+      // ...but the request must carry NO identity, so downstream cannot
+      // mistake it for an authenticated caller.
+      expect(req.headers["x-user-id"]).toBeUndefined();
+      expect(req.headers["x-user-role"]).toBeUndefined();
+    });
+
+    it("removes forged headers even when the route is public AND a token is sent", () => {
+      const { req, res, next, headers } = makeStubs("/register");
+      headers["x-user-id"] = "forged-id";
+      headers["x-user-role"] = "ADMIN";
+      headers["authorization"] = `Bearer ${sign("USER")}`;
+
+      conditionalAuth(["/register"])(req, res, next);
+
+      // Public routes short-circuit before any JWT verification, so the
+      // forged headers must not survive the early return.
+      expect(req.headers["x-user-id"]).toBeUndefined();
+      expect(req.headers["x-user-role"]).toBeUndefined();
+    });
+
+    it("overwrites forged headers with the verified identity on a protected route", () => {
+      const { req, res, next, headers } = makeStubs("/getAll");
+      headers["authorization"] = `Bearer ${sign("ADMIN")}`;
+      headers["x-user-id"] = "forged-id";
+      headers["x-user-role"] = "USER";
+
+      conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+
+      expect(res.status).not.toHaveBeenCalled();
+      expect(req.headers["x-user-id"]).toBe("u1");      // from the token...
+      expect(req.headers["x-user-role"]).toBe("ADMIN");  // ...not the client's
+    });
+
+    it("leaves no forged identity behind on a 401 rejection", () => {
+      const { req, res, next, headers } = makeStubs();
+      headers["x-user-id"] = "forged-id";
+      headers["x-user-role"] = "ADMIN";
+
+      conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      // Even a rejected request must not carry a forged identity onward.
+      expect(req.headers["x-user-id"]).toBeUndefined();
+      expect(req.headers["x-user-role"]).toBeUndefined();
+    });
+  });
 });

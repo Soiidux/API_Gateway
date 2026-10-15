@@ -18,6 +18,27 @@
  * "forbidden for everyone", because `[].includes(role)` is always false.
  * Services that should be reachable by any logged-in user must list the
  * roles explicitly (see the payment service's proxy config).
+ *
+ * SECURITY — why this middleware STRIPS x-user-* on the way in:
+ *
+ * Downstream middleware trusts these headers to mean "a verified JWT said
+ * so":
+ *   - rateLimitMiddleware picks its bucket from `x-user-id` (authenticated
+ *     20 tokens/refill 5/s vs anonymous 2/refill 1/s);
+ *   - cacheKey scopes cached responses by `x-user-id`.
+ *
+ * But HTTP headers are caller-controlled. If we only ever *overwrite* them
+ * on the authenticated path, a client can send its own `x-user-id` on a
+ * PUBLIC route — where we return early, before ever touching the header —
+ * and be treated as a logged-in user. That let anyone sidestep the
+ * anonymous rate limit entirely, and rotating the header per request got a
+ * fresh bucket each time, so unlimited throughput against endpoints that
+ * bcrypt-hash passwords. A free DoS.
+ *
+ * So we delete both headers FIRST, unconditionally, before any branching.
+ * After that line they can only exist because a verified token set them.
+ * Public routes therefore carry no identity at all, which is what makes the
+ * anonymous bucket the correct (and enforceable) one for them.
  */
 
 import type { Request, Response, NextFunction } from "express";
@@ -30,13 +51,19 @@ import jwt from "jsonwebtoken";
 const conditionalAuth = (publicRoutes: string[] = [], roleMap: Record<string, string[]> = {}, defaultRoles: string[] = []) => {
   return (req: Request, res: Response, next: NextFunction) => {
 
+    // Strip caller-supplied identity headers BEFORE any branching below —
+    // including before the public-route early return, which is exactly where
+    // a forged header used to survive. After this, these headers can only
+    // exist because a verified JWT set them. See the SECURITY note above.
+    delete req.headers["x-user-id"];
+    delete req.headers["x-user-role"];
+
     // Check if the request path is a public route
     if (publicRoutes.some(r => req.path === r || req.path.startsWith(`${r}/`))) {
       return next();
     }
 
     try {
-      //Check if token is present 
       //Check if token is present
       const token = getBearerToken(req);
       if (!token) {
@@ -58,7 +85,8 @@ const conditionalAuth = (publicRoutes: string[] = [], roleMap: Record<string, st
         return res.status(responsePayload.status).json(responsePayload);
       }
 
-      //Attach the userId and role as header
+      // Attach the verified userId and role as headers. Safe to set here
+      // because the forged copies were deleted at the top of this function.
       req.headers["x-user-id"] = decoded.userId;
       req.headers["x-user-role"] = decoded.role;
 
