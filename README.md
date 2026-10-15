@@ -185,11 +185,46 @@ headers — which the backend services re-verify themselves (see [Defense in dep
 |---|---|---|---|---|---|
 | POST | `/api/v1/users/register`  | public | — | `registerUserSchema` | no |
 | POST | `/api/v1/users/login`     | public | — | `loginUserSchema`    | no |
-| GET  | `/api/v1/users/getAll`    | JWT   | ADMIN, MANAGER | — | 15 min, per-user |
+| GET  | `/api/v1/users/getAll`    | JWT   | ADMIN, MANAGER | — | no (see below) |
 | POST | `/api/v1/payments/deposit` | JWT   | any valid user | `paymentTxSchema` | no |
 | POST | `/api/v1/payments/withdraw`| JWT   | any valid user | `paymentTxSchema` | no |
-| GET  | `/api/v1/payments/my`     | JWT   | any valid user | — | 15 min, per-user |
-| GET  | `/api/v1/payments/getAll` | JWT   | ADMIN, MANAGER | — | 15 min, per-user |
+| GET  | `/api/v1/payments/my`     | JWT   | any valid user | — | no (see below) |
+| GET  | `/api/v1/payments/getAll` | JWT   | ADMIN, MANAGER | — | no (see below) |
+
+> **Why nothing is cached any more.** These routes *were* cached (15 min), and that
+> was a correctness bug: nothing invalidated a cache entry on write, so a user who
+> deposited 500 was shown a balance of 0 for the rest of the TTL, and brand-new
+> accounts were invisible to admins. Invalidation would have been the alternative,
+> but `/getAll` is cached per-admin, so invalidating it means tracking who primed
+> an entry. Caching correctness-adjacent data you can't invalidate is the wrong
+> trade, so the cache is off for these and left in place as a mechanism
+> (`CacheMiddleware`, `buildCacheKey`, `cachebleRoutes`) for data that genuinely
+> is read-only. The trade-off is written up under Trade-offs below.
+
+### Pagination
+
+All list endpoints are paginated: `?limit=` (default 50, max 200) and `?offset=`. Responses
+carry a `pagination` object with `total` so a client can compute how many pages exist:
+
+```bash
+curl "http://localhost:3000/api/v1/payments/my?limit=25&offset=50" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{"data":{"balance":30,"transactions":[...],
+         "pagination":{"limit":25,"offset":50,"total":137}}}
+```
+
+A malformed or oversized `?limit` is handled rather than rejected — `?limit=abc` returns the
+default page, `?limit=99999` clamps to 200. A client with a bad page parameter should still
+get data.
+
+> **Response shape changed** when pagination was added: `/users/getAll` now returns
+> `{ data: { users: [...], pagination: {...} } }` and `/payments/getAll` returns
+> `{ data: { accounts: [...], pagination: {...} } }`. Previously each was a bare array.
+> A bare array leaves no room to add pagination later without a second breaking change,
+> so the break was made explicit now. `/payments/my` is additive — `balance` and
+> `transactions` are unchanged, `pagination` was added alongside.
 
 > **Gotcha:** a service's `defaultRoles` must be the *full* valid set. `conditionalAuth`
 > treats an empty required-roles array as "forbid everyone" (`[].includes(role)` is `false`),
@@ -203,20 +238,34 @@ headers — which the backend services re-verify themselves (see [Defense in dep
 ```bash
 curl -s -X POST http://localhost:3000/api/v1/users/register \
   -H "Content-Type: application/json" \
-  -d '{"userId":"alice","email":"alice@example.com","password":"hunter2","role":"USER"}'
+  -d '{"userId":"alice","email":"alice@example.com","password":"hunter2pass","role":"USER"}'
 ```
 ```json
 // 201
 {"success":true,"message":"User created successfully","data":{"userId":"alice","email":"alice@example.com","role":"USER"}}
 ```
-Errors: `400` missing/invalid fields or role, `409` duplicate email/userId (unique constraints
-as backstop), `503` DB failure. Password is bcrypt-hashed (10 rounds), never stored/logged.
+Errors: `400` missing/invalid fields or role (including a password under 8 characters),
+`409` duplicate email/userId, `503` DB failure. Password is bcrypt-hashed (10 rounds),
+never stored/logged.
+
+Two things worth knowing about registration:
+
+- **Password policy**: minimum 8 characters, maximum 72. The cap isn't arbitrary — bcrypt only
+  consumes the first 72 *bytes* of a password, so anything past that is silently ignored while
+  the user believes their long passphrase is fully protecting them. `/login` deliberately has
+  **no** length requirement, so users who registered before the policy existed aren't locked out.
+- **Email uniqueness is case-insensitive.** A plain `UNIQUE` on `text` is case-*sensitive* in
+  Postgres, so `Alice@x.com` and `alice@x.com` would become two accounts for one person, both
+  of which would then pass login. Enforced with a `UNIQUE` index over `LOWER(email)`, and the
+  registration pre-check compares with `LOWER()` too so it agrees with the constraint — if they
+  disagreed, a duplicate would slip past the check and surface as a 503 instead of a clean 409.
+  The address is stored with its original casing for display; only the comparison is folded.
 
 #### POST `/api/v1/users/login`
 ```bash
 curl -s -X POST http://localhost:3000/api/v1/users/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"alice@example.com","password":"hunter2"}'
+  -d '{"email":"alice@example.com","password":"hunter2pass"}'
 ```
 ```json
 {"success":true,"message":"Login successful","data":{"token":"<jwt>"}}
@@ -237,7 +286,7 @@ never from a header or body. Balances are `numeric(10,2)`.
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:3000/api/v1/users/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"alice@example.com","password":"hunter2"}' | jq -r .data.token)
+  -d '{"email":"alice@example.com","password":"hunter2pass"}' | jq -r .data.token)
 
 curl -s -X POST http://localhost:3000/api/v1/payments/deposit \
   -H "Content-Type: application/json" \
@@ -344,6 +393,18 @@ and re-checks roles from the verified claims — never from the `x-user-*` heade
 that hits a service container directly (bypassing the gateway) still can't impersonate
 anyone.
 
+`conditionalAuth` also **deletes** any incoming `x-user-id` / `x-user-role` before doing
+anything else, then sets them only from a verified token. This matters because downstream
+middleware trusts them: `rateLimitMiddleware` picks its bucket from `x-user-id`, and
+`cacheKey` scopes cached responses by it. HTTP headers are caller-controlled, so merely
+*overwriting* them on the authenticated path wasn't enough — on a **public** route
+(`/register`, `/login`) the middleware returns early, before any overwrite, so a client
+could send its own `x-user-id`, be treated as authenticated, and escape the 2-request
+anonymous bucket for the 20-request authenticated one. Rotating the header per request got a
+fresh bucket each time: unlimited throughput against endpoints that bcrypt-hash passwords.
+Stripping first makes public routes carry no identity at all, so the anonymous bucket is the
+only one they can land in.
+
 ---
 
 ## Database
@@ -365,10 +426,17 @@ longer matters.
 
 | Table | Owner | Notes |
 |---|---|---|
-| `users` | user-service | `id` PK, `email` unique, `password_hash`, `role` |
+| `users` | user-service | `id` PK, `email` unique + case-insensitive `LOWER(email)` index, `password_hash`, `role` |
 | `accounts` | payment-service | `user_id` PK, `balance numeric(10,2)`, auto-created on first deposit |
-| `transactions` | payment-service | append-only ledger: `DEPOSIT` / `WITHDRAW`, `amount`, `created_at` |
+| `transactions` | payment-service | append-only ledger: `DEPOSIT` / `WITHDRAW`, `amount`, `created_at`; indexed on `(user_id, created_at)` for paginated history |
 | `logs` | log-worker | batch-written observability events, 3 indexes |
+
+**Connection pooling.** Each service sets `max: 5` (log-worker: 10) rather than node-postgres's
+default of 10. Postgres's `max_connections` (default 100) is a *shared* budget, and 3 services ×
+3 replicas × the default 10 would reach 90 — the database would start refusing connections before
+any single process hit its own ceiling. Overflow past the pool size makes a request *wait* rather
+than crash, and `connectionTimeoutMillis: 5000` bounds that wait so exhaustion fails fast (503)
+instead of hanging. If you add a replica or a fourth service, raise these together.
 
 **Migrations:** `INSTANCE_ID=1` runs schema migrations at boot; replicas 2/3 wait until the
 tables exist (`information_schema` poll, 15 s timeout) before serving. Regenerating SQL:
@@ -424,14 +492,14 @@ anything. The gateway ships no migrations, so it doesn't.
 
 ## Testing
 
-74 unit tests across 4 packages (Vitest; DB/Redis/RabbitMQ are never needed — tests inject
+84 unit tests across 4 packages (Vitest; DB/Redis/RabbitMQ are never needed — tests inject
 fakes through the handlers' dependency seams).
 
 ```bash
-(cd gateway && npm test)                    # 28 tests — middleware, balancer, breaker, cache, auth
+(cd gateway && npm test)                    # 32 tests — middleware, balancer, breaker, cache, auth
 (cd gateway && npm test -- --coverage)      # opt into coverage (off by default)
-(cd services/user-service && npm test)      # 16 tests — register / login handlers
-(cd services/payment-service && npm test)   # 22 tests — deposit / withdraw / my / getAll / requireAuth / transactions
+(cd services/user-service && npm test)      # 19 tests — register / login / getUsers pagination
+(cd services/payment-service && npm test)   # 25 tests — deposit / withdraw / my / getAll / requireAuth / transactions
 (cd services/log-worker && npm test)        #  8 tests — batch buffer, retention cleanup
 
 # build check (tsc) — same pattern per package:
@@ -471,13 +539,20 @@ Deliberate simplifications (all annotated in code), good to bring up in an inter
 5. **Caching is per-user** for privacy; a coarser TTL/shared cache would trade privacy for
    fewer backend hits.
 6. **Rate limits are modest** (anon 2 req/s, authed 20 req/s) — tune via the instances file.
-7. **No idempotency keys.** Each payment mutation now runs its balance change and its ledger
+7. **Caching is disabled on all routes.** The cache mechanism is built and working
+   (`CacheMiddleware`, `buildCacheKey`, `cachebleRoutes`), but nothing is registered as
+   cacheable. It was originally on for the three list routes, which was a correctness bug —
+   nothing invalidated on write, so a deposit would be invisible to the depositor for the full
+   TTL and new accounts invisible to admins. Invalidation is the alternative, but a per-admin
+   cache can't be invalidated without tracking who primed it. The honest version of this
+   project is: keep the mechanism, don't use it on data you can't invalidate.
+8. **No idempotency keys.** Each payment mutation now runs its balance change and its ledger
    row in a single `db.transaction()`, so a crash *inside the database* can't leave them out
    of step. That does **not** protect against a client whose request times out and retries —
    the same deposit would be applied twice. Real payment systems take a client-supplied unique
    id, record it with the transaction, and treat a repeat as a no-op. Deliberately out of scope;
    the transaction closes the crash case, the idempotency key closes the retry case.
-8. **Secrets are in compose**, not a secret manager. Fine for a demo, but `JWT_SECRET` and the
+9. **Secrets are in compose**, not a secret manager. Fine for a demo, but `JWT_SECRET` and the
    DB password are plaintext in the compose file — a real deployment would use Docker secrets
    or a vault, and at minimum refuse to boot on a default secret outside dev.
 
@@ -489,3 +564,8 @@ Not yet done (natural next steps):
 - **Integration tests**: the CI e2e job covers the happy path and two error paths against real
   containers; there's no automated concurrency test for the atomic deposit/withdraw guards,
   which is where a race would actually bite.
+- **Token revocation**: 7-day tokens with no logout or deny-list, so a leaked token stays valid
+  for a week. A short-lived access token plus refresh, or a Redis deny-list consulted in
+  `conditionalAuth`, would close it.
+- **No Prometheus metrics**: cache hit rate, rate-limit rejections, and breaker transitions are
+  all computed and then only logged, so nothing can be alerted on.
