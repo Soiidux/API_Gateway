@@ -44,7 +44,25 @@ export class PostgresClient {
   private readonly pool: Pool;
 
   constructor() {
-    this.pool = new Pool({ connectionString: config.DATABASE_URL });
+    this.pool = new Pool({
+      connectionString: config.DATABASE_URL,
+      // POOL SIZING. Same reasoning as the other two services: node-postgres
+      // defaults to max: 10 per process, and 3 services x 3 replicas x 10
+      // would exceed Postgres's default max_connections of 100 before any
+      // single process hit its own ceiling.
+      //
+      // This process is the exception that proves the rule, though: it runs
+      // as a SINGLE container, but it does the highest-volume DB work in the
+      // system — every batch flush is one multi-row insert. A bigger pool
+      // here buys real parallelism when several batches flush at once, while
+      // the stateless request-serving services need very little.
+      max: 10,
+      // Batch inserts must fail fast: a flush that hangs would hold its
+      // messages unacked, and the batch would be redelivered later. Bounding
+      // the wait keeps that retry loop tight instead of stalling the consumer.
+      connectionTimeoutMillis: 5_000,
+      idleTimeoutMillis: 30_000,
+    });
     this.db = drizzle(this.pool, { schema });
   }
 

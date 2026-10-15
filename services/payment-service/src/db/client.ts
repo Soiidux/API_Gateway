@@ -38,7 +38,37 @@ export class PostgresClient {
   private readonly pool: Pool;
 
   constructor() {
-    this.pool = new Pool({ connectionString: config.DATABASE_URL });
+    this.pool = new Pool({
+      connectionString: config.DATABASE_URL,
+      // POOL SIZING. node-postgres defaults to max: 10, which is fine for a
+      // single process but wrong here: three services x three replicas each
+      // means up to 90 connections against a Postgres whose own default
+      // max_connections is 100. The database would run out of connections
+      // (and start refusing new ones) before the app reached any single
+      // process's own limit.
+      //
+      // Postgres's limit is a shared budget across everything that connects —
+      // this pool, the other two services' pools, and any psql session — so
+      // the per-process number is deliberately small. Overflow beyond it
+      // makes a request WAIT (bounded by connectionTimeoutMillis) rather than
+      // crash, which is the failure mode you want: graceful degradation
+      // instead of connection errors.
+      //
+      // With 3 services x 3 replicas x 5 = 45, leaving headroom under 100.
+      // If you ever add a replica or a fourth service, raise these together
+      // and confirm Postgres's max_connections can absorb the total.
+      max: 5,
+      // Don't hang a request forever waiting for a connection that will never
+      // come. Without this, pool exhaustion shows up as requests that never
+      // respond; with it, they fail fast with a 503 (the controllers map any
+      // DB error to 503) and the logs say why.
+      //
+      // This matters more here than in the other services: a timed-out
+      // connection mid-transaction is the case where a deposit could be
+      // applied without its ledger row.
+      connectionTimeoutMillis: 5_000,
+      idleTimeoutMillis: 30_000,
+    });
     this.db = drizzle(this.pool, { schema });
   }
 
