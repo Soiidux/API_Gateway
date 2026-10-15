@@ -4,7 +4,7 @@ import jwt from "jsonwebtoken";
 import config from "../config.js";
 import { PostgresClient } from "../db/client.js";
 import { users } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 /**
  * User service HTTP handlers.
@@ -43,14 +43,39 @@ type Database = typeof postgres.db;
 
 const VALID_ROLES = ["ADMIN", "MANAGER", "USER"] as const;
 
+/** Pagination defaults/limits for list endpoints. */
+const PAGE_SIZE_DEFAULT = 50;
+const PAGE_SIZE_MAX = 200;
+
+/**
+ * Parses a non-negative-integer query param (limit/offset), clamping
+ * limit to PAGE_SIZE_MAX and falling back to `fallback` for anything absent
+ * or unparseable. Deliberately forgiving: a bad page param still returns data
+ * rather than a 400.
+ */
+function parseLimit(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.min(Math.floor(parsed), PAGE_SIZE_MAX);
+}
+
 /**
  * GET /getAll — requires ADMIN/MANAGER. Reads real users from Postgres.
  *
  * `password_hash` is never selected back out, so it can't leak in a
  * response. Only id/email/name/role/createdAt are exposed.
+ *
+ * PAGINATED via ?limit= (default 50, max 200) and ?offset=. This was an
+ * unbounded SELECT over the whole table on every call, so response size grew
+ * with total users. The id primary key is already indexed, which is what makes
+ * the LIMIT/OFFSET cheap.
  */
 export const getUsers = async (req: Request, res: Response, db: Database = postgres.db) => {
   console.log(`[User Service ${process.env.INSTANCE_ID}] Handled request on port ${config.PORT}`);
+
+  const limit = parseLimit(req.query.limit, PAGE_SIZE_DEFAULT);
+  const offset = parseLimit(req.query.offset, 0);
 
   const rows = await db
     .select({
@@ -60,12 +85,24 @@ export const getUsers = async (req: Request, res: Response, db: Database = postg
       role: users.role,
       createdAt: users.createdAt,
     })
-    .from(users);
+    .from(users)
+    .orderBy(users.id) // stable ordering, so offset paging can't skip/duplicate rows
+    .limit(limit)
+    .offset(offset);
 
-  const apiResponsePayload: ApiResponse<object[]> = {
+  const [countRow] = await db.select({ count: sql<number>`count(*)` }).from(users);
+
+  const apiResponsePayload: ApiResponse<{
+    users: typeof rows;
+    pagination: { limit: number; offset: number; total: number };
+  }> = {
     success: true,
     message: "Users fetched successfully",
-    data: rows,
+    // Response shape CHANGED: the list moved under `data.users` to make room
+    // for `data.pagination`. The old shape was a bare array, leaving no room
+    // to add pagination without a breaking change later — better to make the
+    // break explicit now.
+    data: { users: rows, pagination: { limit, offset, total: Number(countRow?.count ?? 0) } },
     status: 200,
   };
   return res.status(apiResponsePayload.status).json(apiResponsePayload);
@@ -112,10 +149,17 @@ export const registerUser = async (req: Request, res: Response, db: Database = p
   try {
     // Check BOTH business keys up front so a duplicate gets a clean 409
     // instead of crashing at insert time.
+    //
+    // Compared with LOWER(email), NOT `email = email`, because Postgres text
+    // equality is case-sensitive: without this, `Alice@x.com` would not match
+    // the existing `alice@x.com` row, the pre-check would pass, and the INSERT
+    // would then be rejected by the unique index — turning a clean 409 into a
+    // generic 503. The pre-check and the constraint have to agree on the same
+    // notion of equality, or the error handling is unreachable.
     const existing = await db
       .select({ id: users.id })
       .from(users)
-      .where(eq(users.email, email));
+      .where(sql`LOWER(${users.email}) = LOWER(${email})`);
 
     if (existing.length > 0) {
       const conflict: ApiResponse<null> = {
@@ -203,7 +247,7 @@ export const loginUser = async (req: Request, res: Response, db: Database = post
         passwordHash: users.passwordHash,
       })
       .from(users)
-      .where(eq(users.email, email));
+      .where(sql`LOWER(${users.email}) = LOWER(${email})`); // case-insensitive, matches the unique index
 
     const row = rows[0];
 

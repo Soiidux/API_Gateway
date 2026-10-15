@@ -21,8 +21,10 @@ function makeRes() {
   return res as unknown as Response & { status: ReturnType<typeof vi.fn>; json: ReturnType<typeof vi.fn> };
 }
 
-function makeReq(body: unknown) {
-  return { body } as Request;
+function makeReq(body: unknown, query: Record<string, unknown> = {}) {
+  // `query` defaults to {} so handlers that read pagination params (getUsers
+  // reads ?limit/?offset) work with the plain makeReq({}) call sites.
+  return { body, query } as Request;
 }
 
 /** Minimal chainable fake of the Drizzle query builder.
@@ -175,20 +177,88 @@ describe("loginUser", () => {
 });
 
 describe("getUsers", () => {
-  it("returns the rows from the database", async () => {
+  /**
+   * getUsers is PAGINATED (?limit= default 50 max 200, ?offset=), so the fake
+   * db has to be a full query-builder chain: select().from().orderBy().limit()
+   * .offset(), plus a second select() for the COUNT. `from()` returning a
+   * single thenable object would break the chain, hence building it explicitly.
+   */
+  function paginatedDb(rows: unknown[]) {
+    // Chain order in the controller is
+    //   select().from().orderBy().limit().offset()   <- the page
+    //   select({count}).from()                       <- the total (awaited directly)
+    //
+    // So `from()` has to satisfy two shapes: chaining onward AND being
+    // awaitable as an array. Returning a real array with the chain methods
+    // attached satisfies both — `await` yields the array, while .orderBy() etc.
+    // still work on it.
+    const offset = vi.fn().mockResolvedValue(rows);
+    const limit = vi.fn(() => ({ offset }));
+    const orderBy = vi.fn(() => ({ limit }));
+
+    const pageResult = [] as unknown as unknown[] & Record<string, unknown>;
+    pageResult.orderBy = orderBy;
+    pageResult.limit = limit;
+
+    // The count query resolves to a one-row shape like [{ count: n }].
+    const countResult = [{ count: rows.length }];
+    let call = 0;
+    const from = vi.fn(() => (call++ === 0 ? pageResult : countResult));
+
+    const select = vi.fn(() => ({ from }));
+    return { db: { select } as never, limit, offset, orderBy, from, select };
+  }
+
+  it("returns the rows under data.users with pagination metadata", async () => {
     const rows = [{ id: "u1", email: "a@b.com", name: "A", role: "USER", createdAt: new Date() }];
-    const db = {
-      select: vi.fn().mockReturnValue({
-        from: vi.fn().mockResolvedValue(rows),
-      }),
-    };
+    const { db, limit, offset } = paginatedDb(rows);
     const res = makeRes();
 
-    await getUsers(makeReq({}), res, db as never);
+    await getUsers(makeReq({}, {}), res, db);
 
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ data: rows, success: true }),
+      expect.objectContaining({
+        success: true,
+        data: {
+          users: rows,
+          pagination: { limit: 50, offset: 0, total: 1 },
+        },
+      }),
     );
+    // Default page size is applied by default.
+    expect(limit).toHaveBeenCalledWith(50);
+    expect(offset).toHaveBeenCalledWith(0);
+  });
+
+  it("honours ?limit and ?offset from the query string", async () => {
+    const { db, limit, offset } = paginatedDb([]);
+    const res = makeRes();
+
+    await getUsers(makeReq({}, { limit: "10", offset: "20" }), res, db);
+
+    expect(limit).toHaveBeenCalledWith(10);
+    expect(offset).toHaveBeenCalledWith(20);
+  });
+
+  it("clamps an oversized ?limit to the 200 maximum", async () => {
+    const { db, limit } = paginatedDb([]);
+    const res = makeRes();
+
+    await getUsers(makeReq({}, { limit: "100000" }), res, db);
+
+    // Unbounded page sizes are exactly the problem pagination is fixing.
+    expect(limit).toHaveBeenCalledWith(200);
+  });
+
+  it("falls back to defaults for a malformed ?limit rather than erroring", async () => {
+    const { db, limit, offset } = paginatedDb([]);
+    const res = makeRes();
+
+    await getUsers(makeReq({}, { limit: "abc", offset: "-5" }), res, db);
+
+    expect(limit).toHaveBeenCalledWith(50);
+    expect(offset).toHaveBeenCalledWith(0);
+    expect(res.status).toHaveBeenCalledWith(200);
   });
 });
