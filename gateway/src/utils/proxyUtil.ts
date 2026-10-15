@@ -51,9 +51,17 @@ class ProxyUtil {
         "/register": schema.registerUserSchema, // validate request body against this schema
         "/login": schema.loginUserSchema,
       },
-      cachebleRoutes: {
-        "/getAll": { ttl: 15 * 60 * 1000 },
-      },
+      // INTENTIONALLY NOT CACHED. Nothing invalidates cache entries, and
+      // /register changes exactly this data — a newly created user would be
+      // invisible to admins for the full 15-minute TTL. User rows change on
+      // every registration, so there is no write pattern here that a
+      // read-mostly assumption would survive.
+      //
+      // (This route WAS cached, which meant a user who registered then
+      // immediately called /users/getAll as an admin saw a stale list.)
+      // See the README's trade-offs for why "no invalidation" forced the
+      // decision to drop caching here rather than build it.
+      cachebleRoutes: {},
     },
     {
       path: "/api/v1/payments",
@@ -71,10 +79,21 @@ class ProxyUtil {
         "/deposit": schema.paymentTxSchema, // validate the amount before forwarding
         "/withdraw": schema.paymentTxSchema,
       },
-      cachebleRoutes: {
-        "/getAll": { ttl: 15 * 60 * 1000 },
-        "/my": { ttl: 15 * 60 * 1000 },
-      },
+      // INTENTIONALLY EMPTY — money routes are never cached.
+      //
+      // deposit/withdraw mutate the very rows /my and /getAll return, and
+      // nothing in this codebase invalidates a cache entry on write. So a
+      // cached balance is a confidently WRONG number: a user deposits 500,
+      // sees the deposit response confirm it, then GETs /my and is shown the
+      // pre-deposit balance for up to 15 minutes. Verified live before this
+      // change (cached /my reported 0 while Postgres held 500.00), and the
+      // /getAll variant hid brand-new accounts from admins entirely.
+      //
+      // The alternative — invalidating on every mutation — can't be done
+      // cheaply here: /getAll is cached per-admin, so invalidating it means
+      // knowing which admins primed an entry (or introducing key tagging).
+      // Choosing correctness over hit-rate is the right trade for balances.
+      cachebleRoutes: {},
     },
   ];
 
