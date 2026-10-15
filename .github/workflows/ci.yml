@@ -118,12 +118,12 @@ jobs:
           echo "→ register"
           curl -fsS -X POST "$BASE/api/v1/users/register" \
             -H 'Content-Type: application/json' \
-            -d '{"userId":"ci-user","email":"ci@example.com","password":"hunter2","role":"USER"}'
+            -d '{"userId":"ci-user","email":"ci@example.com","password":"hunter2pass","role":"USER"}'
 
           echo; echo "→ login"
           TOKEN=$(curl -fsS -X POST "$BASE/api/v1/users/login" \
             -H 'Content-Type: application/json' \
-            -d '{"email":"ci@example.com","password":"hunter2"}' \
+            -d '{"email":"ci@example.com","password":"hunter2pass"}' \
             | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).data.token))')
 
           echo "got token (${#TOKEN} chars)"
