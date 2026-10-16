@@ -49,7 +49,7 @@ log consumer.
 | Database | PostgreSQL 16 via `drizzle-orm` / `drizzle-kit` (versioned SQL migrations) |
 | Cache / rate-limit store | Redis 7 (`ioredis`), token-bucket via atomic Lua script |
 | Message queue | RabbitMQ 3 (`amqp-connection-manager`) |
-| Auth | `jsonwebtoken` (HS256), `bcryptjs` for password hashing |
+| Auth | `jsonwebtoken` (HS256, algorithm pinned on verify), `bcryptjs` for password hashing |
 | Validation | Zod |
 | Tests | Vitest (unit tests, injected fakes — no DB/network needed) |
 | Orchestration | Docker Compose |
@@ -225,6 +225,14 @@ A malformed or oversized `?limit` is handled rather than rejected — `?limit=ab
 default page, `?limit=99999` clamps to 200. A client with a bad page parameter should still
 get data.
 
+> **Known limit of OFFSET pagination.** Ordering by a primary key makes each page *deterministic*
+> — the same request returns the same rows — but it does **not** make paging safe under concurrent
+> writes. A row inserted between two page fetches shifts every later page by one, so a row can
+> appear twice or be missed. That's inherent to `OFFSET`, not a flaw in the ordering. The fix is
+> **keyset pagination** (`WHERE id > last_seen_id ORDER BY id LIMIT n`), which is immune to
+> shifting and — because it needs no total — removes the `COUNT` query entirely. Worth doing on
+> `/payments/my`, whose data actually grows without bound.
+
 > **Response shape changed** when pagination was added: `/users/getAll` now returns
 > `{ data: { users: [...], pagination: {...} } }` and `/payments/getAll` returns
 > `{ data: { accounts: [...], pagination: {...} } }`. Previously each was a bare array.
@@ -251,7 +259,11 @@ curl -s -X POST http://localhost:3000/api/v1/users/register \
 {"success":true,"message":"User created successfully","data":{"userId":"alice","email":"alice@example.com","role":"USER"}}
 ```
 Errors: `400` missing/invalid fields or role (including a password under 8 characters),
-`409` duplicate email/userId, `503` DB failure. Password is bcrypt-hashed (10 rounds),
+`409` duplicate **email or userId** — both unique keys are pre-checked, and a unique violation
+at INSERT (SQLSTATE `23505`, which two concurrent registrations of the same key can still
+produce) also maps to `409` rather than `503`. That distinction matters: `503` tells a client the
+server is broken and to retry, so a retrying client would loop forever without learning the id
+was taken. Any other database failure stays a `503`. Password is bcrypt-hashed (10 rounds),
 never stored/logged.
 
 Two things worth knowing about registration:
@@ -477,6 +489,12 @@ fresh bucket each time: unlimited throughput against endpoints that bcrypt-hash 
 Stripping first makes public routes carry no identity at all, so the anonymous bucket is the
 only one they can land in.
 
+Every `jwt.verify` call site (the gateway plus both services' `requireAuth`) passes
+`algorithms: ["HS256"]` rather than relying on jsonwebtoken's default of "whatever the header
+claims, as long as it works with this key". Not exploitable as configured — the secret is
+symmetric and v9 rejects `alg: none` — but pinning means a future change of key type can't
+silently widen what gets accepted.
+
 ---
 
 ## Database
@@ -564,13 +582,13 @@ anything. The gateway ships no migrations, so it doesn't.
 
 ## Testing
 
-103 unit tests across 4 packages (Vitest; DB/Redis/RabbitMQ are never needed — tests inject
+111 unit tests across 4 packages (Vitest; DB/Redis/RabbitMQ are never needed — tests inject
 fakes through the handlers' dependency seams).
 
 ```bash
-(cd gateway && npm test)                    # 45 tests — middleware, balancer, breaker, cache, auth, revocation
+(cd gateway && npm test)                    # 48 tests — middleware, balancer, breaker, cache, auth, revocation
 (cd gateway && npm test -- --coverage)      # opt into coverage (off by default)
-(cd services/user-service && npm test)      # 25 tests — register / login / logout / getUsers pagination
+(cd services/user-service && npm test)      # 30 tests — register / login / logout / duplicate detection / pagination
 (cd services/payment-service && npm test)   # 25 tests — deposit / withdraw / my / getAll / requireAuth / transactions
 (cd services/log-worker && npm test)        #  8 tests — batch buffer, retention cleanup
 
@@ -643,5 +661,8 @@ Not yet done (natural next steps):
 - **Concurrency tests**: the CI e2e job covers the happy path and two error paths against real
   containers; there's no automated concurrency test for the atomic deposit/withdraw guards,
   which is where a race would actually bite.
+- **Keyset pagination**: all list endpoints use `OFFSET`, which shifts under concurrent writes
+  (see the Pagination section). `/payments/my` is the one whose data grows without bound and
+  would most benefit from `WHERE created_at < last_seen`-style cursors.
 - **No Prometheus metrics**: cache hit rate, rate-limit rejections, breaker transitions, and
   revocation hits are all computed and then only logged, so nothing can be alerted on.
