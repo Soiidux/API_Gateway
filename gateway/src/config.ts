@@ -24,6 +24,18 @@ const config: Config = {
   PAYMENT_SERVICE_URLS: process.env.PAYMENT_SERVICE_URLS ? getServiceUrls(process.env.PAYMENT_SERVICE_URLS) : [],
   REDIS_URL: process.env.REDIS_URL || "",
   RABBITMQ_URL: process.env.RABBITMQ_URL || "",
+
+  /**
+   * Token lifetime in seconds, used ONLY to set the TTL on the revocation
+   * records this gateway writes on logout. Kept as the same number the
+   * user-service mints tokens with — a revocation record must outlive every
+   * token it invalidates, and if it expired sooner, revoked tokens would
+   * quietly become valid again.
+   *
+   * The token's own expiry is set where it's signed (user-service). This is
+   * not a second source of truth for that; it's the matching TTL.
+   */
+  TOKEN_TTL: parseInt(process.env.TOKEN_TTL || "3600", 10),
 }
 
 export default config;

@@ -1,12 +1,23 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../config.js", () => ({
-  default: { JWT_SECRET: "test-secret" },
+  default: { JWT_SECRET: "test-secret", TOKEN_TTL: 3600 },
+}));
+
+// The revocation store is a real Redis connection at import time. Stub the
+// module so these tests stay offline; the revocation logic itself is covered
+// in tokenRevocation.test.ts.
+vi.mock("../utils/tokenRevocation.js", () => ({
+  isRevoked: vi.fn().mockResolvedValue(false),
+  revokedKey: (id: string) => `revoked:${id}`,
 }));
 
 import jwt from "jsonwebtoken";
 import conditionalAuth from "./conditionalAuth.js";
+import { isRevoked } from "../utils/tokenRevocation.js";
 import type { NextFunction, Request, Response } from "express";
+
+const revoked = () => isRevoked as unknown as ReturnType<typeof vi.fn>;
 
 function makeStubs(path = "/getAll") {
   const headers: Record<string, unknown> = {};
@@ -49,6 +60,7 @@ describe("conditionalAuth", () => {
     const { req, res, next, headers } = makeStubs();
     headers["authorization"] = "NotBearer something";
 
+    // Synchronous: the no-token path returns before the revocation await.
     conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
 
     expect(res.status).toHaveBeenCalledWith(401);
@@ -63,20 +75,20 @@ describe("conditionalAuth", () => {
     expect(res.status).toHaveBeenCalledWith(401);
   });
 
-  it("returns 403 when the role is not permitted for the route", () => {
+  it("returns 403 when the role is not permitted for the route", async () => {
     const { req, res, next, headers } = makeStubs();
     headers["authorization"] = `Bearer ${sign("USER")}`;
 
-    conditionalAuth([], { "/getAll": ["ADMIN", "MANAGER"] })(req, res, next);
+    await conditionalAuth([], { "/getAll": ["ADMIN", "MANAGER"] })(req, res, next);
 
     expect(res.status).toHaveBeenCalledWith(403);
   });
 
-  it("sets x-user-id / x-user-role and calls next for a permitted role", () => {
+  it("sets x-user-id / x-user-role and calls next for a permitted role", async () => {
     const { req, res, next, headers } = makeStubs();
     headers["authorization"] = `Bearer ${sign("ADMIN")}`;
 
-    conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+    await conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
 
     expect(next).toHaveBeenCalledTimes(1);
     expect(req.headers["x-user-id"]).toBe("u1");
@@ -84,12 +96,12 @@ describe("conditionalAuth", () => {
     expect(res.status).not.toHaveBeenCalled();
   });
 
-  it("falls back to defaultRoles when the route is not in the roleMap", () => {
+  it("falls back to defaultRoles when the route is not in the roleMap", async () => {
     const { req, res, next, headers } = makeStubs("/anywhere");
     headers["authorization"] = `Bearer ${sign("USER")}`;
 
     // defaultRoles = ["ADMIN"] -> USER should be rejected
-    conditionalAuth([], {}, ["ADMIN"])(req, res, next);
+    await conditionalAuth([], {}, ["ADMIN"])(req, res, next);
 
     expect(res.status).toHaveBeenCalledWith(403);
   });
@@ -140,13 +152,13 @@ describe("conditionalAuth", () => {
       expect(req.headers["x-user-role"]).toBeUndefined();
     });
 
-    it("overwrites forged headers with the verified identity on a protected route", () => {
+    it("overwrites forged headers with the verified identity on a protected route", async () => {
       const { req, res, next, headers } = makeStubs("/getAll");
       headers["authorization"] = `Bearer ${sign("ADMIN")}`;
       headers["x-user-id"] = "forged-id";
       headers["x-user-role"] = "USER";
 
-      conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+      await conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
 
       expect(res.status).not.toHaveBeenCalled();
       expect(req.headers["x-user-id"]).toBe("u1");      // from the token...
@@ -165,5 +177,75 @@ describe("conditionalAuth", () => {
       expect(req.headers["x-user-id"]).toBeUndefined();
       expect(req.headers["x-user-role"]).toBeUndefined();
     });
+  });
+});
+/**
+ * Revocation integration in conditionalAuth.
+ *
+ * A valid signature is necessary but NOT sufficient: the user may have logged
+ * out since the token was minted. These pin that the check actually happens
+ * before the token's role is trusted, and that a revoked token gets no identity
+ * headers attached even if it would otherwise pass RBAC.
+ */
+describe("conditionalAuth — revoked tokens", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    revoked().mockResolvedValue(false);
+  });
+
+  it("checks revocation with the token's userId and iat after verifying the JWT", async () => {
+    const { req, res, next, headers } = makeStubs("/getAll");
+    const token = sign("ADMIN");
+    headers["authorization"] = `Bearer ${token}`;
+    const decoded = jwt.decode(token) as { userId: string; iat: number };
+
+    await conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+
+    expect(revoked()).toHaveBeenCalledWith("u1", decoded.iat);
+  });
+
+  it("returns 401 and does NOT authenticate a revoked token", async () => {
+    revoked().mockResolvedValue(true);
+    const { req, res, next, headers } = makeStubs("/getAll");
+    headers["authorization"] = `Bearer ${sign("ADMIN")}`;
+
+    await conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    // Critically: no identity headers, so nothing downstream can act on it.
+    expect(next).not.toHaveBeenCalled();
+    expect(req.headers["x-user-id"]).toBeUndefined();
+    expect(req.headers["x-user-role"]).toBeUndefined();
+  });
+
+  it("rejects a revoked token even when its role would be permitted", async () => {
+    revoked().mockResolvedValue(true);
+    const { req, res, next, headers } = makeStubs("/getAll");
+    headers["authorization"] = `Bearer ${sign("ADMIN")}`;
+
+    await conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+
+    // Revocation is checked BEFORE the role check, so a still-valid signature
+    // carrying ADMIN gains nothing.
+    expect(res.status).toHaveBeenCalledWith(401);
+  });
+
+  it("allows a non-revoked token through normally", async () => {
+    const { req, res, next, headers } = makeStubs("/getAll");
+    headers["authorization"] = `Bearer ${sign("ADMIN")}`;
+
+    await conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(req.headers["x-user-id"]).toBe("u1");
+  });
+
+  it("does not consult the revocation store for a PUBLIC route (no identity to check)", async () => {
+    const { req, res, next } = makeStubs("/register");
+
+    await conditionalAuth(["/register"])(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(revoked()).not.toHaveBeenCalled();
   });
 });

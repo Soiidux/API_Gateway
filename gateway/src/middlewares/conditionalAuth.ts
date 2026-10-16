@@ -45,11 +45,16 @@ import type { Request, Response, NextFunction } from "express";
 import config from "../config.js";
 import { getBearerToken } from "../utils/getBearerToken.js";
 import generateApiResponse from "../utils/generateApiResponse.js";
+import { isRevoked } from "../utils/tokenRevocation.js";
 import jwt from "jsonwebtoken";
 
 
 const conditionalAuth = (publicRoutes: string[] = [], roleMap: Record<string, string[]> = {}, defaultRoles: string[] = []) => {
-  return (req: Request, res: Response, next: NextFunction) => {
+  // `async` because the revocation check awaits a Redis lookup. Express 4 does
+  // NOT catch async middleware rejections, but the body below is wrapped in
+  // try/catch so no rejection can escape — the only throw path (jwt.verify) is
+  // caught in-handler.
+  return async (req: Request, res: Response, next: NextFunction) => {
 
     // Strip caller-supplied identity headers BEFORE any branching below —
     // including before the public-route early return, which is exactly where
@@ -72,7 +77,21 @@ const conditionalAuth = (publicRoutes: string[] = [], roleMap: Record<string, st
       }
 
       //Decode the token (throws on missing/expired/bad-signature -> caught below as 401)
-      const decoded : { userId: string, role: string } = jwt.verify(token, config.JWT_SECRET) as { userId: string, role: string };
+      // `iat` is added automatically by jsonwebtoken and is what the
+      // revocation check compares against a user's logout time.
+      const decoded : { userId: string, role: string, iat?: number } =
+        jwt.verify(token, config.JWT_SECRET) as { userId: string, role: string, iat?: number };
+
+      // A valid signature is necessary but NOT sufficient: the user may have
+      // logged out since this token was minted, and a JWT can't be un-issued.
+      // So consult the revocation store before trusting the role in it.
+      //
+      // Fails open if Redis is unreachable (see utils/tokenRevocation.ts) —
+      // bounded by TOKEN_TTL, since an unrevoked token still expires on time.
+      if (await isRevoked(decoded.userId, decoded.iat)) {
+        const responsePayload: ApiResponse<null> = generateApiResponse<null>(null, "Unauthorized", 401);
+        return res.status(responsePayload.status).json(responsePayload);
+      }
 
       //Check if the user has the required role
       // 1. Scan the roleMap keys to see if the incoming route matches or starts with a protected path

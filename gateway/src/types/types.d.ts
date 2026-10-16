@@ -27,6 +27,7 @@ declare global {
     PAYMENT_SERVICE_URLS: string[];
     REDIS_URL: string;
     RABBITMQ_URL: string;
+    TOKEN_TTL: number;
   }
   interface ServiceConfig {
     path: string;
