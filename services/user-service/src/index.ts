@@ -1,8 +1,9 @@
 import express, { type Request, type RequestHandler, type Response } from "express";
 import dotenv from "dotenv";
-import { getUsers, loginUser, rateLimiterCheck, registerUser } from "./controllers/user.controllers.js";
+import { getUsers, loginUser, logout, rateLimiterCheck, registerUser } from "./controllers/user.controllers.js";
 import { requireAuth } from "./middlewares/requireAuth.js";
 import { PostgresClient } from "./db/client.js";
+import { closeRedis } from "./db/redisClient.js";
 import { Readiness } from "./health.js";
 import config from "./config.js";
 dotenv.config();
@@ -75,6 +76,11 @@ async function main(): Promise<void> {
   app.get("/getAll", requireAuth, ((req: Request, res: Response) => getUsers(req, res)) as unknown as RequestHandler);
   app.post("/register", ((req: Request, res: Response) => registerUser(req, res)) as unknown as RequestHandler);
   app.post("/login", ((req: Request, res: Response) => loginUser(req, res)) as unknown as RequestHandler);
+  // /logout is JWT-protected on purpose: the identity comes from the verified
+  // token, so there's no way to revoke someone ELSE's sessions by guessing a
+  // userId. The gateway's defaultRoles already gates this route — it isn't in
+  // publicRoutes — and requireAuth re-verifies the token at this hop.
+  app.post("/logout", requireAuth, ((req: Request, res: Response) => logout(req, res)) as unknown as RequestHandler);
   app.get("/", rateLimiterCheck);
 
   const server = app.listen(config.PORT, () => {
@@ -114,6 +120,11 @@ async function main(): Promise<void> {
     server.close(async () => {
       try {
         await postgres.end();
+        // Close Redis last-ish: it's the revocation store, and an in-flight
+        // logout that has already passed the DB stage still needs it to write
+        // its marker. Quitting it before the drain finished would silently
+        // turn a successful logout into a 503.
+        await closeRedis();
         console.log("[User Service] Shutdown complete.");
         process.exit(0);
       } catch (error) {

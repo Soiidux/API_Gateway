@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import config from "../config.js";
 import { PostgresClient } from "../db/client.js";
+import { revokeUserTokens } from "../db/redisClient.js";
 import { users } from "../db/schema.js";
 import { eq, sql } from "drizzle-orm";
 
@@ -24,6 +25,10 @@ import { eq, sql } from "drizzle-orm";
  * GetAll (GET /getAll): requires ADMIN/MANAGER — enforced BOTH by the
  * gateway (RBAC) and re-checked here from the verified JWT via
  * requireAuth, so the service is safe even when hit directly.
+ *
+ * Logout (POST /logout): writes a revocation marker to Redis so the gateway
+ * rejects this user's existing tokens from now on. A JWT can't be un-issued,
+ * so deleting the client's copy only protects that one client.
  */
 
 interface ApiResponse<T> {
@@ -274,7 +279,7 @@ export const loginUser = async (req: Request, res: Response, db: Database = post
     const token = jwt.sign(
       { userId: row.userId, role: row.role },
       config.JWT_SECRET,
-      { expiresIn: "7d" },
+      { expiresIn: config.TOKEN_TTL },
     );
 
     const apiResponsePayload: ApiResponse<{ token: string }> = {
@@ -289,6 +294,89 @@ export const loginUser = async (req: Request, res: Response, db: Database = post
     const serverError: ApiResponse<null> = {
       success: false,
       message: "Login failed",
+      status: 503,
+      data: null,
+    };
+    return res.status(503).json(serverError);
+  }
+};
+
+/**
+ * POST /logout — revoke every token this user currently holds.
+ *
+ * Deleting the client's copy of a JWT doesn't un-issue it. Anything else
+ * holding that token — a stolen copy, a shared machine, a log file — keeps
+ * working until `exp`, because validating it never involves asking anyone
+ * whether it's still wanted. So logout writes a revocation marker to Redis:
+ *
+ *     SET revoked:<userId> <now epoch seconds>  EX <TOKEN_TTL>
+ *
+ * and the gateway rejects any token whose `iat` is at or before that moment
+ * (see gateway/src/utils/tokenRevocation.ts).
+ *
+ * Two properties worth knowing:
+ *
+ *  - ONE KEY PER USER, not per token. Every outstanding token dies at once,
+ *    which is what you want from a logout, and the key space is bounded by
+ *    user count rather than growing with every logout.
+ *
+ *  - IT SELF-EXPIRES. After TOKEN_TTL no token minted before the revocation can
+ *    still be valid, so the record is dead weight and Redis drops it. That TTL
+ *    must therefore track the token lifetime exactly: too short and revoked
+ *    tokens silently come back to life, too long and we hold useless data.
+ *
+ * Also the right hook for a future "change my password" — bumping this same
+ * marker invalidates every session, which is the correct response to a
+ * suspected compromise. Same for a role change: a token minted while someone
+ * was ADMIN still says ADMIN in its payload, and only this marker can fix that
+ * before it expires.
+ *
+ * Requires a valid token (the gateway's defaultRoles covers /logout), so the
+ * identity comes from the verified JWT in `req.auth` — never from the body.
+ *
+ * Idempotent: logging out twice, or with a token that's already been revoked,
+ * both return 200. There's nothing to "already be done" about.
+ */
+export const logout = async (req: Request, res: Response) => {
+  const userId = req.auth?.userId;
+  if (!userId) {
+    const unauthorized: ApiResponse<null> = {
+      success: false,
+      message: "Unauthorized",
+      status: 401,
+      data: null,
+    };
+    return res.status(401).json(unauthorized);
+  }
+
+  try {
+    // Math.floor because the JWT `iat` claim is integer seconds — writing a
+    // fractional value would make the `iat <= revokedAt` comparison behave
+    // oddly at the boundary.
+    const now = Math.floor(Date.now() / 1000);
+    await revokeUserTokens(userId, now);
+
+    console.log(`[User Service ${config.INSTANCE_ID}] Revoked tokens for ${userId}`);
+
+    const payload: ApiResponse<null> = {
+      success: true,
+      message: "Logged out successfully",
+      status: 200,
+      data: null,
+    };
+    return res.status(200).json(payload);
+  } catch (error) {
+    // Redis is unreachable, so the revocation marker was NOT written. Returning
+    // 503 is the honest answer: telling the client "logged out" when nothing
+    // was revoked would be worse than useless — they'd believe they're safe.
+    //
+    // This is the opposite of the read path, which fails OPEN. That asymmetry
+    // is intentional: reads must not take authentication down, but a write that
+    // didn't happen has to be reported rather than assumed.
+    console.error("[User Service] Logout failed:", error);
+    const serverError: ApiResponse<null> = {
+      success: false,
+      message: "Logout failed: could not record revocation",
       status: 503,
       data: null,
     };

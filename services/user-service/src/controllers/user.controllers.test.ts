@@ -6,11 +6,25 @@ vi.mock("../config.js", () => ({
   default: {
     JWT_SECRET: "test-secret",
     INSTANCE_ID: "test",
-    PORT: 3001,
+    PORT: 1,
+    // loginUser signs with `expiresIn: config.TOKEN_TTL`, so the mock must
+    // provide it or jwt.sign throws on undefined.
+    TOKEN_TTL: 3600,
   },
 }));
 
-import { getUsers, loginUser, registerUser } from "./user.controllers.js";
+// The revocation store is a real Redis connection at import time; stub the
+// module so unit tests never touch the network.
+vi.mock("../db/redisClient.js", () => ({
+  default: { get: vi.fn(), set: vi.fn(), quit: vi.fn() },
+  revokeUserTokens: vi.fn().mockResolvedValue(undefined),
+  isRevoked: vi.fn().mockResolvedValue(false),
+  revokedKey: (id: string) => `revoked:${id}`,
+  closeRedis: vi.fn().mockResolvedValue(undefined),
+}));
+
+import { getUsers, loginUser, logout, registerUser } from "./user.controllers.js";
+import { revokeUserTokens } from "../db/redisClient.js";
 import type { Request, Response } from "express";
 
 function makeRes() {
@@ -260,5 +274,114 @@ describe("getUsers", () => {
     expect(limit).toHaveBeenCalledWith(50);
     expect(offset).toHaveBeenCalledWith(0);
     expect(res.status).toHaveBeenCalledWith(200);
+  });
+});
+/**
+ * Logout / token revocation.
+ *
+ * A JWT is self-contained, so deleting the client's copy doesn't un-issue it.
+ * Logout writes `revoked:<userId> = <now>` to Redis, and the gateway rejects
+ * any token whose `iat` is at or before that moment.
+ *
+ * These tests pin the two behaviours that are easy to get wrong:
+ *  - the identity comes from req.auth (the verified token), never the body, so
+ *    nobody can revoke someone else's sessions by guessing a userId;
+ *  - a failed write reports 503 rather than pretending success, because a
+ *    client told "logged out" when nothing was revoked is worse off than one
+ *    told the truth.
+ */
+describe("logout", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  function authedReq(userId: string) {
+    return { body: {}, auth: { userId, role: "USER" } } as unknown as Request;
+  }
+
+  it("records a revocation marker keyed by the verified userId", async () => {
+    const res = makeRes();
+
+    await logout(authedReq("u1"), res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(revokeUserTokens).toHaveBeenCalledTimes(1);
+    // Second arg must be integer epoch seconds — the JWT `iat` claim is an
+    // integer, so a fractional marker breaks the comparison boundary.
+    const [, at] = (revokeUserTokens as unknown as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(Number.isInteger(at)).toBe(true);
+    expect(at).toBeGreaterThan(0);
+  });
+
+  it("ignores any userId in the request body and revokes only the token's user", async () => {
+    const res = makeRes();
+    const req = {
+      body: { userId: "victim" },
+      auth: { userId: "attacker", role: "USER" },
+    } as unknown as Request;
+
+    await logout(req, res);
+
+    // The body's userId must be ignored entirely — otherwise anyone could
+    // revoke another account's sessions.
+    expect(revokeUserTokens).toHaveBeenCalledWith("attacker", expect.any(Number));
+  });
+
+  it("returns 401 when there is no verified identity", async () => {
+    const res = makeRes();
+
+    await logout({ body: {} } as unknown as Request, res);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(revokeUserTokens).not.toHaveBeenCalled();
+  });
+
+  it("returns 503 when the revocation marker could NOT be written", async () => {
+    (revokeUserTokens as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("redis down"),
+    );
+    const res = makeRes();
+
+    await logout(authedReq("u1"), res);
+
+    // Reporting 200 here would tell the user they're safe when they are not.
+    expect(res.status).toHaveBeenCalledWith(503);
+  });
+
+  it("is idempotent — a second logout still succeeds", async () => {
+    const res1 = makeRes();
+    const res2 = makeRes();
+
+    await logout(authedReq("u1"), res1);
+    await logout(authedReq("u1"), res2);
+
+    expect(res1.status).toHaveBeenCalledWith(200);
+    expect(res2.status).toHaveBeenCalledWith(200);
+  });
+});
+
+describe("token lifetime", () => {
+  it("issues a token whose exp - iat equals TOKEN_TTL (1 hour), not 7 days", async () => {
+    // loginUser issues a token, so this test is really about the signing
+    // config rather than the DB — the fake just has to satisfy the handler.
+    const db = chainableDb([
+      { userId: "u1", email: "a@b.com", role: "USER", passwordHash: "h" },
+    ]);
+    // Real bcrypt round-trip rather than a spy: this test only cares about the
+    // SIGNING config (expiresIn), so the password check just has to pass.
+    const realHash = bcrypt.hashSync("x", 4); // low rounds: speed, not security
+    const ttlRes = makeRes();
+
+    await loginUser(
+      makeReq({ email: "a@b.com", password: "x" }),
+      ttlRes,
+      chainableDb([{ userId: "u1", email: "a@b.com", role: "USER", passwordHash: realHash }]) as never,
+    );
+
+    const token = (ttlRes.json as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![0].data.token;
+    const decoded = jwt.decode(token) as { iat: number; exp: number };
+
+    expect(decoded.exp - decoded.iat).toBe(3600);
+    // 7 days was the old value; assert the change explicitly so a silent
+    // reversion to a week-long token is caught here.
+    expect(decoded.exp - decoded.iat).not.toBe(7 * 24 * 3600);
   });
 });

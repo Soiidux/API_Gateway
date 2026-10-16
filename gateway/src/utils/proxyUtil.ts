@@ -44,6 +44,12 @@ class ProxyUtil {
       name: "user-service",                // used as the key for this service's load balancer
       timeout: 5000,                       // how long to wait before giving up on a request
       publicRoutes: ["/register", "/login", "/"],         // no JWT required for these
+      // Any valid JWT may reach the non-roleMap routes here (/logout).
+      // This MUST be the full role set: conditionalAuth treats an empty
+      // required-roles array as "forbid everyone" (`[].includes(role)` is
+      // false), not as "public". Omitting it made /logout 403 for everyone —
+      // the exact trap documented on conditionalAuth.ts.
+      defaultRoles: ["ADMIN", "MANAGER", "USER"],
       roleMap: {
         "/getAll": ["ADMIN", "MANAGER"],   // only these roles may call /getAll
       },

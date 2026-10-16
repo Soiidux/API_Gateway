@@ -85,6 +85,7 @@ services:
       PAYMENT_SERVICE_URLS: http://payment-service-1:3002,http://payment-service-2:3002,http://payment-service-3:3002
       REDIS_URL: redis://gateway_redis:6379
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+      TOKEN_TTL: 3600
     ports:
       - "3000:3000"
     networks:
@@ -128,6 +129,13 @@ services:
       INSTANCE_ID: 1
       JWT_SECRET: ${JWT_SECRET:-gateway_secret_is_super_secure}
       DATABASE_URL: postgres://${POSTGRES_USER:-gateway_user}:${POSTGRES_PASSWORD:-gateway_secure_password}@postgres:5432/${POSTGRES_DB:-gateway_db}
+      # Revocation store: /logout writes here, the gateway reads it on
+      # every authenticated request.
+      REDIS_URL: redis://gateway_redis:6379
+      # Must match the gateway's TOKEN_TTL — a revocation record that
+      # expires before the tokens it invalidates would let revoked
+      # tokens quietly become valid again.
+      TOKEN_TTL: 3600
     networks:
       - gateway_net
     depends_on:
@@ -142,6 +150,13 @@ services:
       INSTANCE_ID: 2
       JWT_SECRET: ${JWT_SECRET:-gateway_secret_is_super_secure}
       DATABASE_URL: postgres://${POSTGRES_USER:-gateway_user}:${POSTGRES_PASSWORD:-gateway_secure_password}@postgres:5432/${POSTGRES_DB:-gateway_db}
+      # Revocation store: /logout writes here, the gateway reads it on
+      # every authenticated request.
+      REDIS_URL: redis://gateway_redis:6379
+      # Must match the gateway's TOKEN_TTL — a revocation record that
+      # expires before the tokens it invalidates would let revoked
+      # tokens quietly become valid again.
+      TOKEN_TTL: 3600
     networks:
       - gateway_net
     depends_on:
@@ -156,6 +171,13 @@ services:
       INSTANCE_ID: 3
       JWT_SECRET: ${JWT_SECRET:-gateway_secret_is_super_secure}
       DATABASE_URL: postgres://${POSTGRES_USER:-gateway_user}:${POSTGRES_PASSWORD:-gateway_secure_password}@postgres:5432/${POSTGRES_DB:-gateway_db}
+      # Revocation store: /logout writes here, the gateway reads it on
+      # every authenticated request.
+      REDIS_URL: redis://gateway_redis:6379
+      # Must match the gateway's TOKEN_TTL — a revocation record that
+      # expires before the tokens it invalidates would let revoked
+      # tokens quietly become valid again.
+      TOKEN_TTL: 3600
     networks:
       - gateway_net
     depends_on:
