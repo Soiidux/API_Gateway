@@ -26,7 +26,12 @@ export const requireAuth = (req: Request, res: Response, next: NextFunction) => 
   const token = header.startsWith("Bearer ") ? header.slice(7) : header;
 
   try {
-    const decoded = jwt.verify(token, config.JWT_SECRET) as { userId: string; role: string };
+    // `algorithms` is pinned rather than left to jsonwebtoken's default of
+    // "whatever the token claims, as long as it works with this key". Not
+    // exploitable today (symmetric secret, v9 rejects `alg: none`), but this
+    // is the check guarding money-touching routes, so the accepted set should
+    // be explicit.
+    const decoded = jwt.verify(token, config.JWT_SECRET, { algorithms: ["HS256"] }) as { userId: string; role: string };
     req.auth = decoded;
     return next();
   } catch {

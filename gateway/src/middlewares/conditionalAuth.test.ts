@@ -249,3 +249,73 @@ describe("conditionalAuth — revoked tokens", () => {
     expect(revoked()).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * JWT algorithm pinning.
+ *
+ * `verify` is called with `algorithms: ["HS256"]` rather than jsonwebtoken's
+ * default of "whatever the header claims, as long as it works with this key".
+ * This isn't exploitable today — we sign with a symmetric secret and v9
+ * rejects `alg: none` — but pinning means a future key-type change can't
+ * silently widen what this endpoint accepts.
+ */
+describe("conditionalAuth — algorithm pinning", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    revoked().mockResolvedValue(false);
+  });
+
+  it("accepts a token signed with HS256 (the algorithm we issue)", async () => {
+    const { req, res, next, headers } = makeStubs("/getAll");
+    headers["authorization"] = `Bearer ${sign("ADMIN")}`;
+
+    await conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(req.headers["x-user-id"]).toBe("u1");
+  });
+
+  it("rejects an unsigned token (alg: none)", async () => {
+    const { req, res, next, headers } = makeStubs("/getAll");
+    // header.payload. with an empty signature and alg: none.
+    //
+    // NOTE: this passes with OR without the algorithms pin — jsonwebtoken v9
+    // rejects `none` regardless. Kept as a regression guard on that behaviour,
+    // since a downgrade would reintroduce the classic unsigned-token bypass.
+    const unsigned =
+      Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url") +
+      "." +
+      Buffer.from(JSON.stringify({ userId: "u1", role: "ADMIN" })).toString("base64url") +
+      ".";
+    headers["authorization"] = `Bearer ${unsigned}`;
+
+    await conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("rejects a token declaring an algorithm outside the allowlist", async () => {
+    const { req, res, next, headers } = makeStubs("/getAll");
+    // Correctly signed with the same secret, but claims a different algorithm.
+    // Without pinning, "does it work with this key" would be the only test.
+    const swapped =
+      Buffer.from(JSON.stringify({ alg: "HS512", typ: "JWT" })).toString("base64url") +
+      "." +
+      Buffer.from(JSON.stringify({ userId: "u1", role: "ADMIN" })).toString("base64url") +
+      "." +
+      require("node:crypto")
+        .createHmac("sha512", "test-secret")
+        .update(
+          Buffer.from(JSON.stringify({ alg: "HS512", typ: "JWT" })).toString("base64url") +
+            "." +
+            Buffer.from(JSON.stringify({ userId: "u1", role: "ADMIN" })).toString("base64url"),
+        )
+        .digest("base64url");
+    headers["authorization"] = `Bearer ${swapped}`;
+
+    await conditionalAuth([], { "/getAll": ["ADMIN"] })(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+  });
+});

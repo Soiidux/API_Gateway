@@ -79,8 +79,16 @@ const conditionalAuth = (publicRoutes: string[] = [], roleMap: Record<string, st
       //Decode the token (throws on missing/expired/bad-signature -> caught below as 401)
       // `iat` is added automatically by jsonwebtoken and is what the
       // revocation check compares against a user's logout time.
+      //
+      // `algorithms` is pinned to HS256 rather than left to jsonwebtoken's
+      // default of "whatever the token's header claims, as long as it works
+      // with this key". That default is not exploitable today — we sign with a
+      // symmetric secret and v9 rejects `alg: none` — but pinning means a
+      // future change of key type can't silently widen what this endpoint
+      // will accept. One line, and it makes the intent explicit.
       const decoded : { userId: string, role: string, iat?: number } =
-        jwt.verify(token, config.JWT_SECRET) as { userId: string, role: string, iat?: number };
+        jwt.verify(token, config.JWT_SECRET, { algorithms: ["HS256"] }) as
+          { userId: string, role: string, iat?: number };
 
       // A valid signature is necessary but NOT sufficient: the user may have
       // logged out since this token was minted, and a JWT can't be un-issued.
