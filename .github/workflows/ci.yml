@@ -78,6 +78,74 @@ jobs:
         run: docker compose build
 
   # ---------------------------------------------------------------------------
+  # Concurrency tests against REAL Postgres and Redis.
+  #
+  # These assert properties that belong to the datastore, not to this
+  # TypeScript: that Postgres serialises the atomic upsert and the conditional
+  # UPDATE (so concurrent withdrawals can't overdraw), and that Redis runs the
+  # Lua token bucket without interleaving (so a burst can't exceed capacity).
+  # A mock cannot demonstrate either — it returns whatever the test dictates —
+  # so these need actual services. Kept in their own job so the fast unit suite
+  # stays fast and a slow failure is easy to attribute.
+  # ---------------------------------------------------------------------------
+  concurrency:
+    name: concurrency (real Postgres + Redis)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway_user
+          POSTGRES_PASSWORD: gateway_secure_password
+          POSTGRES_DB: gateway_db
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway_user"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            gateway/package-lock.json
+            services/payment-service/package-lock.json
+
+      - name: Install gateway
+        run: npm ci
+        working-directory: gateway
+
+      - name: Install payment-service
+        run: npm ci
+        working-directory: services/payment-service
+
+      - name: Payment money paths under concurrent load
+        run: npm run test:integration
+        working-directory: services/payment-service
+        env:
+          DATABASE_URL: postgres://gateway_user:gateway_secure_password@localhost:5432/gateway_db
+
+      - name: Rate limiter atomicity under concurrent load
+        run: npm run test:integration
+        working-directory: gateway
+        env:
+          REDIS_URL: redis://localhost:6379
+
+  # ---------------------------------------------------------------------------
   # Smoke test: start the whole stack, wait for health, then prove the API
   # answers end to end (register -> login -> deposit -> 422 -> RBAC -> logs).
   #
