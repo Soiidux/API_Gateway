@@ -151,12 +151,13 @@ zero configuration. Override any of them in `.env`.
 | `JWT_SECRET` | gateway + all services | `gateway_secret_is_super_secure` | HS256 signing secret — **change in prod** |
 | `USER_SERVICE_URLS` | gateway | 3 replica URLs | round-robin targets |
 | `PAYMENT_SERVICE_URLS` | gateway | 3 replica URLs | round-robin targets |
-| `REDIS_URL` | gateway | `redis://gateway_redis:6379` | rate-limit + cache store |
+| `REDIS_URL` | gateway, user-service | `redis://gateway_redis:6379` | gateway: cache + rate limits; user-service: **revocation store** |
 | `RABBITMQ_URL` | gateway, log-worker | `amqp://guest:guest@rabbitmq:5672` | log pipeline transport |
 | `DATABASE_URL` | services, log-worker, drizzle | `postgres://…@postgres:5432/gateway_db` | Postgres connection |
 | `POSTGRES_USER/PASSWORD/DB` | postgres | `gateway_user / gateway_secure_password / gateway_db` | initial database |
 | `RABBITMQ_USER/PASSWORD` | rabbitmq | `guest / guest` | broker credentials |
 | `INSTANCE_ID` | services | 1–3 | replica id; `1` owns the migration |
+| `TOKEN_TTL` | gateway, user-service | `3600` | token lifetime in seconds; also the revocation record's TTL. **Must match across both** |
 | `RETENTION_DAYS` | log-worker | `30` | delete log rows older than this, at boot + every interval |
 | `RETENTION_INTERVAL_HOURS` | log-worker | `6` | how often the retention cleanup re-runs |
 | `NODE_ENV` | all images | `production` | set in the runtime stage; enables npm's production behaviour |
@@ -179,12 +180,17 @@ taken from the **DB row** (never from the request body). The gateway verifies th
 every protected route and re-scopes identity for the backend via `x-user-id` / `x-user-role`
 headers — which the backend services re-verify themselves (see [Defense in depth](#defense-in-depth)).
 
+Tokens live **1 hour** (`TOKEN_TTL`, default `3600`), and `POST /logout` revokes them. See
+[Token revocation](#token-revocation) for why the lifetime is the number that actually matters
+and why logout alone wouldn't have been enough.
+
 ### Scope table
 
 | Method | Path | Auth | Allowed roles | Body validation | Cached |
 |---|---|---|---|---|---|
 | POST | `/api/v1/users/register`  | public | — | `registerUserSchema` | no |
 | POST | `/api/v1/users/login`     | public | — | `loginUserSchema`    | no |
+| POST | `/api/v1/users/logout`    | JWT   | any valid user | — | no |
 | GET  | `/api/v1/users/getAll`    | JWT   | ADMIN, MANAGER | — | no (see below) |
 | POST | `/api/v1/payments/deposit` | JWT   | any valid user | `paymentTxSchema` | no |
 | POST | `/api/v1/payments/withdraw`| JWT   | any valid user | `paymentTxSchema` | no |
@@ -271,10 +277,24 @@ curl -s -X POST http://localhost:3000/api/v1/users/login \
 {"success":true,"message":"Login successful","data":{"token":"<jwt>"}}
 ```
 `401` for unknown email **or** wrong password (deliberately identical message — no account
-enumeration). Token expires in 7 days.
+enumeration). Token expires in **1 hour**.
+
+#### POST `/api/v1/users/logout` — requires `Authorization: Bearer <token>`
+```bash
+curl -s -X POST http://localhost:3000/api/v1/users/logout -H "Authorization: Bearer $TOKEN"
+```
+```json
+{"success":true,"message":"Logged out successfully","status":200,"data":null}
+```
+Returns `200` and immediately invalidates **every** token this user holds — including copies
+elsewhere. Idempotent. `401` without a valid token; `503` if the revocation marker could not be
+written (it reports the failure rather than pretending you logged out).
 
 #### GET `/api/v1/users/getAll` — requires `Authorization: Bearer <token>`, ADMIN/MANAGER
-Returns all users as `[{ id, email, name, role, createdAt }, …]`.
+```json
+{ "data": { "users": [ { "id", "email", "name", "role", "createdAt" } ], "pagination": {...} } }
+```
+Paginated — see [Pagination](#pagination).
 
 ### Payments
 
@@ -385,6 +405,58 @@ published to the log pipeline — watch them live: `docker compose logs -f gatew
 4. A retention job (also run at boot) deletes rows older than `RETENTION_DAYS` (30) every
    `RETENTION_INTERVAL_HOURS` (6), so the table can't grow without bound.
 
+### Token revocation
+
+A JWT is **self-contained**: nobody asks the server "is this still valid?" — the signature is
+checked and the payload is believed. That is what makes it fast, and it is also why **a JWT
+cannot be un-issued**. Deleting the client's copy on logout only protects that one client; a
+copy in a log file, a shared browser, or someone else's hands keeps working until `exp`.
+
+That is why two things are needed, and only together are they sufficient.
+
+**1. A short lifetime.** `TOKEN_TTL` defaults to 3600 (1 hour), down from 7 days. A stolen
+token is worth whatever remains of its lifetime, and that number — not the presence of any
+revocation list — is the real exposure. It's also the only defence against a token that leaks
+and whose owner never notices, which no deny-list can help with.
+
+**2. A deny-list.** `/logout` records *when* a user's tokens died:
+
+```
+logout:  SET revoked:<userId> <epoch seconds>  EX <TOKEN_TTL>
+verify:  reject the token if its `iat` <= that value
+```
+
+Keyed by **user**, not by token — so every outstanding token dies at once (which is what a
+logout should mean), and the key space is bounded by user count rather than growing with every
+logout. The entry **self-expires**: after `TOKEN_TTL` no token minted before the revocation can
+still be alive, so Redis drops it. That TTL has to track the token lifetime exactly — too short
+and revoked tokens quietly come back to life, too long and you're holding dead data.
+
+The same mechanism would also handle **role changes**: a token minted while someone was an
+admin still says `ADMIN` in its payload forever, and only a revocation bump can correct that
+before it expires. That's the hook a future "change my password" or "demote this user" endpoint
+would use.
+
+**Failing open, deliberately.** This lookup sits on every authenticated request, so Redis is now
+on the critical path for all authenticated traffic. If it fails, the token is treated as *not*
+revoked. That is only defensible *because* the lifetime is short: revocation is a convenience
+layer over expiry, not the primary control, so a Redis outage costs at most one hour of
+exposure for a token whose owner explicitly logged out — bounded and small — instead of
+authentication failing outright for everyone.
+
+> **Honest caveat, found while testing this:** failing open buys nothing end-to-end here,
+> because the **rate limiter hits the same Redis and fails CLOSED**. Stopping Redis returned
+> `500` for every request, including `/login` — the request never reaches the revocation check.
+> So in this system a Redis outage is a total outage regardless. The revocation check is still
+> correct to fail open (that is the right behavior for this dependency), but the availability
+> story would need the rate limiter to agree before failing open actually bought resilience.
+> Making the limiter fail open too is a deliberate decision with its own trade-offs — unlimited
+> traffic during an outage is how you take down a backend.
+
+The proper fix for the underlying issue isn't any of this: **short-lived access token plus a
+refresh token**, so the access token's exposure window is small and revocation only ever applies
+to the refresh token. See [Trade-offs](#documented-trade-offs--production-hardening).
+
 ### Defense in depth
 
 Proxy-forwarded headers are forgeable, so every backend route that matters ALSO verifies the
@@ -492,13 +564,13 @@ anything. The gateway ships no migrations, so it doesn't.
 
 ## Testing
 
-84 unit tests across 4 packages (Vitest; DB/Redis/RabbitMQ are never needed — tests inject
+103 unit tests across 4 packages (Vitest; DB/Redis/RabbitMQ are never needed — tests inject
 fakes through the handlers' dependency seams).
 
 ```bash
-(cd gateway && npm test)                    # 32 tests — middleware, balancer, breaker, cache, auth
+(cd gateway && npm test)                    # 45 tests — middleware, balancer, breaker, cache, auth, revocation
 (cd gateway && npm test -- --coverage)      # opt into coverage (off by default)
-(cd services/user-service && npm test)      # 19 tests — register / login / getUsers pagination
+(cd services/user-service && npm test)      # 25 tests — register / login / logout / getUsers pagination
 (cd services/payment-service && npm test)   # 25 tests — deposit / withdraw / my / getAll / requireAuth / transactions
 (cd services/log-worker && npm test)        #  8 tests — batch buffer, retention cleanup
 
@@ -515,8 +587,10 @@ fakes through the handlers' dependency seams).
 2. **`docker`** — `docker compose build`, which catches broken Dockerfiles that no amount of
    npm testing would.
 3. **`e2e`** — brings the whole stack up with `--wait`, then proves it works: register → login →
-   deposit → a 422 over-withdrawal → an RBAC 403 → and that log rows actually reached Postgres.
-   Container logs are dumped on failure.
+   deposit → a 422 over-withdrawal → an RBAC 403 → **token still valid → logout → same token
+   now 401** → and that log rows actually reached Postgres. Container logs are dumped on
+   failure. The logout step deliberately reuses the *same* token rather than logging in again,
+   since a fresh token would pass regardless of whether revocation works.
 
 No lint step: there is no ESLint or Prettier configured in this repo, so CI checks types,
 tests, images, and behaviour rather than style.
@@ -555,17 +629,19 @@ Deliberate simplifications (all annotated in code), good to bring up in an inter
 9. **Secrets are in compose**, not a secret manager. Fine for a demo, but `JWT_SECRET` and the
    DB password are plaintext in the compose file — a real deployment would use Docker secrets
    or a vault, and at minimum refuse to boot on a default secret outside dev.
+10. **Revocation is a mitigation, not a fix.** A 1-hour lifetime plus a Redis deny-list bounds
+    how long a stolen token is useful, but the token is still self-contained and the check costs
+    a Redis round-trip on every request. The real answer is short-lived access tokens (15 min)
+    plus refresh tokens, where revocation applies only to the refresh token and the hot path
+    needs no lookup.
 
 Not yet done (natural next steps):
 - **Observability**: no metrics endpoint (Prometheus), no tracing. Cache hit rate, rate-limit
   rejections, and breaker state are all computed but not exported.
 - **Linting/formatting**: there is no ESLint or Prettier configured, so CI checks
   types + tests + builds but not style.
-- **Integration tests**: the CI e2e job covers the happy path and two error paths against real
+- **Concurrency tests**: the CI e2e job covers the happy path and two error paths against real
   containers; there's no automated concurrency test for the atomic deposit/withdraw guards,
   which is where a race would actually bite.
-- **Token revocation**: 7-day tokens with no logout or deny-list, so a leaked token stays valid
-  for a week. A short-lived access token plus refresh, or a Redis deny-list consulted in
-  `conditionalAuth`, would close it.
-- **No Prometheus metrics**: cache hit rate, rate-limit rejections, and breaker transitions are
-  all computed and then only logged, so nothing can be alerted on.
+- **No Prometheus metrics**: cache hit rate, rate-limit rejections, breaker transitions, and
+  revocation hits are all computed and then only logged, so nothing can be alerted on.
