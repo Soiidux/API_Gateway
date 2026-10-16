@@ -146,6 +146,22 @@ jobs:
             -H "Authorization: Bearer $TOKEN")
           test "$STATUS" = "403" || { echo "expected 403, got $STATUS"; exit 1; }
 
+          # Token revocation. The whole point of the deny-list is that a token
+          # the gateway still considers well-signed stops working after logout,
+          # so this asserts on the SAME token before and after — not a fresh one.
+          echo; echo "→ token works before logout"
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/payments/my" \
+            -H "Authorization: Bearer $TOKEN")
+          test "$STATUS" = "200" || { echo "expected 200, got $STATUS"; exit 1; }
+
+          echo "→ logout"
+          curl -fsS -X POST "$BASE/api/v1/users/logout" -H "Authorization: Bearer $TOKEN" >/dev/null
+
+          echo "→ same token rejected after logout (expect 401)"
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/payments/my" \
+            -H "Authorization: Bearer $TOKEN")
+          test "$STATUS" = "401" || { echo "expected 401, got $STATUS"; exit 1; }
+
           echo; echo "→ confirming the log pipeline delivered rows to Postgres"
           docker exec gateway_postgres psql -U gateway_user -d gateway_db -tAc \
             "SELECT count(*) FROM logs WHERE user_id = 'ci-user'" \
