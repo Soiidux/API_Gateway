@@ -43,7 +43,24 @@ redis.call("HMSET", key, "tokens", tokens, "timestamp", now)
 
 -- let idle buckets expire from Redis instead of living forever
 -- (give it enough time to fully refill twice over, as a safety margin)
-redis.call("EXPIRE", key, math.ceil((capacity / refillRate) * 2))
+--
+-- GUARDED: (capacity / refillRate) divides by zero when refillRate is 0 or
+-- negative, making idleSeconds infinite, which Redis rejects with "ERR value
+-- is not an integer or out of range". The script would then throw on EVERY
+-- request for that key -- and because this limiter fails CLOSED on a Redis
+-- error, one misconfigured rate would take the whole gateway down rather
+-- than merely misbehave. So clamp instead of dividing.
+local idleSeconds
+if refillRate > 0 then
+  idleSeconds = math.ceil((capacity / refillRate) * 2)
+else
+  -- No usable refill rate. Fall back to a fixed hour so keys still expire
+  -- instead of accumulating forever. A bucket that never refills is almost
+  -- certainly a misconfiguration, but it should degrade to "throttled for an
+  -- hour", not to a divide-by-zero.
+  idleSeconds = 3600
+end
+redis.call("EXPIRE", key, idleSeconds)
 
 return allowed
 `;
