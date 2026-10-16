@@ -52,6 +52,32 @@ const VALID_ROLES = ["ADMIN", "MANAGER", "USER"] as const;
 const PAGE_SIZE_DEFAULT = 50;
 const PAGE_SIZE_MAX = 200;
 
+/** Postgres SQLSTATE for a unique-constraint violation. */
+const PG_UNIQUE_VIOLATION = "23505";
+
+/**
+ * Did this error come from a unique-constraint violation?
+ *
+ * Checks the `code` property that node-postgres puts on the error, which is
+ * the SQLSTATE. Matching on the error MESSAGE instead would be brittle — the
+ * text is localised and embeds the offending values, so it varies with locale
+ * and drags user input into control flow.
+ *
+ * Walks `cause` too: Drizzle wraps driver errors, so the SQLSTATE is not
+ * always on the outermost error object.
+ */
+function isUniqueViolation(error: unknown): boolean {
+  let current: unknown = error;
+  // Bounded walk so a malformed chain can't loop; 5 levels is far more than
+  // Drizzle + node-postgres actually nest.
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (code === PG_UNIQUE_VIOLATION) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 /**
  * Parses a non-negative-integer query param (limit/offset), clamping
  * limit to PAGE_SIZE_MAX and falling back to `fallback` for anything absent
@@ -91,7 +117,13 @@ export const getUsers = async (req: Request, res: Response, db: Database = postg
       createdAt: users.createdAt,
     })
     .from(users)
-    .orderBy(users.id) // stable ordering, so offset paging can't skip/duplicate rows
+    // Ordering by the primary key makes each page DETERMINISTIC — the same
+    // request returns the same rows. It does NOT make offset paging immune to
+    // concurrent writes: a row inserted between two page fetches shifts every
+    // later page by one, so a row can be seen twice or missed entirely.
+    // Eliminating that needs keyset pagination (WHERE id > last_seen_id),
+    // not a better ORDER BY. Documented rather than papered over.
+    .orderBy(users.id)
     .limit(limit)
     .offset(offset);
 
@@ -152,8 +184,16 @@ export const registerUser = async (req: Request, res: Response, db: Database = p
   }
 
   try {
-    // Check BOTH business keys up front so a duplicate gets a clean 409
+    // Check BOTH unique keys up front so a duplicate gets a clean 409
     // instead of crashing at insert time.
+    //
+    // BOTH means both: `id` is a primary key AND `email` is unique. Checking
+    // only email left a hole — registering an existing `userId` with a fresh
+    // email passed this pre-check, then blew up on the id primary key at
+    // INSERT and surfaced as a generic 503. That's the wrong signal: 503 tells
+    // a client "the server is broken, retry later", so a client that retries
+    // would loop forever without ever learning the id was taken. 409 is the
+    // answer that lets it move on.
     //
     // Compared with LOWER(email), NOT `email = email`, because Postgres text
     // equality is case-sensitive: without this, `Alice@x.com` would not match
@@ -164,7 +204,7 @@ export const registerUser = async (req: Request, res: Response, db: Database = p
     const existing = await db
       .select({ id: users.id })
       .from(users)
-      .where(sql`LOWER(${users.email}) = LOWER(${email})`);
+      .where(sql`LOWER(${users.email}) = LOWER(${email}) OR ${users.id} = ${userId}`);
 
     if (existing.length > 0) {
       const conflict: ApiResponse<null> = {
@@ -198,8 +238,26 @@ export const registerUser = async (req: Request, res: Response, db: Database = p
     };
     return res.status(apiResponsePayload.status).json(apiResponsePayload);
   } catch (error) {
-    // A race between the SELECT above and the INSERT would bubble up as a
-    // unique-violation error — treat any constraint error as a duplicate.
+    // Postgres SQLSTATE 23505 = unique_violation. The SELECT above can never be
+    // atomic with the INSERT, so two concurrent registrations of the same
+    // email or id can BOTH pass the pre-check and race to INSERT. The loser
+    // gets 23505 — which is a duplicate, not a server fault, and deserves the
+    // same 409 the pre-check returns.
+    //
+    // Without this branch every such race returned 503, so the behaviour the
+    // old comment described ("treat any constraint error as a duplicate")
+    // simply didn't exist. Anything else — connection reset, timeout, disk
+    // error — is a genuine 503.
+    if (isUniqueViolation(error)) {
+      const conflict: ApiResponse<null> = {
+        success: false,
+        message: "User already exists",
+        status: 409,
+        data: null,
+      };
+      return res.status(409).json(conflict);
+    }
+
     console.error("[User Service] Registration failed:", error);
     const serverError: ApiResponse<null> = {
       success: false,

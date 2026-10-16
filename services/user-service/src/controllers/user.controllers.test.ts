@@ -385,3 +385,100 @@ describe("token lifetime", () => {
     expect(decoded.exp - decoded.iat).not.toBe(7 * 24 * 3600);
   });
 });
+
+/**
+ * Duplicate detection must cover BOTH unique keys.
+ *
+ * `id` is a primary key and `email` is unique, so either one colliding is a
+ * duplicate. Checking only email meant an existing userId with a fresh email
+ * sailed through the pre-check, hit the PK at INSERT, and returned 503 — the
+ * wrong signal entirely, since 503 says "server broken, retry" and a retrying
+ * client would loop forever without learning the id was taken.
+ */
+describe("registerUser — duplicate detection", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  /** A DB whose INSERT raises the given error, with the pre-check passing. */
+  function dbWithInsertError(err: unknown) {
+    const values = vi.fn().mockRejectedValue(err);
+    return {
+      db: {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) }),
+        }),
+        insert: vi.fn().mockReturnValue({ values }),
+      } as never,
+      values,
+    };
+  }
+
+  const body = { userId: "u1", email: "fresh@b.com", password: "hunter2pass", role: "USER" };
+
+  it("returns 409 (not 503) when the INSERT hits a unique violation", async () => {
+    const { db } = dbWithInsertError(
+      Object.assign(new Error("duplicate key value violates unique constraint"), {
+        code: "23505",
+      }),
+    );
+    const res = makeRes();
+
+    await registerUser(makeReq(body), res, db);
+
+    // 23505 means "duplicate", which is a client error (409), not a server
+    // fault (503).
+    expect(res.status).toHaveBeenCalledWith(409);
+  });
+
+  it("finds a unique violation nested under `cause`, as Drizzle wraps driver errors", async () => {
+    const { db } = dbWithInsertError({
+      message: "DrizzleQueryError",
+      cause: Object.assign(new Error("duplicate key"), { code: "23505" }),
+    });
+    const res = makeRes();
+
+    await registerUser(makeReq(body), res, db);
+
+    // The SQLSTATE isn't always on the outermost error object.
+    expect(res.status).toHaveBeenCalledWith(409);
+  });
+
+  it("still returns 503 for a genuine database failure", async () => {
+    const { db } = dbWithInsertError(
+      Object.assign(new Error("connection terminated"), { code: "08006" }),
+    );
+    const res = makeRes();
+
+    await registerUser(makeReq(body), res, db);
+
+    // Only 23505 is a duplicate. A dead connection must not masquerade as one.
+    expect(res.status).toHaveBeenCalledWith(503);
+  });
+
+  it("does not match on error message text — only the SQLSTATE counts", async () => {
+    const { db } = dbWithInsertError(
+      Object.assign(new Error("duplicate key value violates unique constraint"), {
+        code: "08006",
+      }),
+    );
+    const res = makeRes();
+
+    await registerUser(makeReq(body), res, db);
+
+    // The message says "duplicate" but the code doesn't. Trusting the message
+    // would misreport an infrastructure failure as a user error.
+    expect(res.status).toHaveBeenCalledWith(503);
+  });
+
+  it("survives a malformed cause chain without looping forever", async () => {
+    // Self-referential cause: a naive `while (current = current.cause)` would
+    // hang the request thread.
+    const err: Record<string, unknown> = { message: "boom", code: "08006" };
+    err.cause = err;
+    const { db } = dbWithInsertError(err);
+    const res = makeRes();
+
+    await registerUser(makeReq(body), res, db);
+
+    expect(res.status).toHaveBeenCalledWith(503);
+  });
+});
