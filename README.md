@@ -582,8 +582,8 @@ anything. The gateway ships no migrations, so it doesn't.
 
 ## Testing
 
-111 unit tests across 4 packages (Vitest; DB/Redis/RabbitMQ are never needed — tests inject
-fakes through the handlers' dependency seams).
+111 unit tests across 4 packages, plus 11 concurrency tests against real Postgres and Redis
+(the unit tests inject fakes through the handlers' dependency seams).
 
 ```bash
 (cd gateway && npm test)                    # 48 tests — middleware, balancer, breaker, cache, auth, revocation
@@ -596,6 +596,39 @@ fakes through the handlers' dependency seams).
 (cd gateway && npm run build)
 ```
 
+### Concurrency tests (real Postgres + Redis)
+
+Some properties belong to the *datastore*, not to this TypeScript:
+
+- that Postgres serialises the atomic upsert and the conditional `UPDATE`, so
+  concurrent withdrawals can never overdraw
+- that Redis executes the Lua token bucket without interleaving, so a burst of
+  parallel requests can never exceed the bucket's capacity
+
+A mock cannot demonstrate either — it returns whatever the test tells it to. So these run
+against real services:
+
+```bash
+# needs DATABASE_URL and/or REDIS_URL; each suite skips itself if its var is absent
+(cd gateway && REDIS_URL=redis://localhost:6379 npm run test:integration)
+(cd services/payment-service && DATABASE_URL=postgres://... npm run test:integration)
+```
+
+**These guards were validated by breaking the code on purpose.** A test that passes trivially
+proves nothing, so each was checked against a deliberately naive implementation:
+
+| Guard | Naive implementation | Result |
+|---|---|---|
+| 20 concurrent withdrawals against a 100 balance | `SELECT` → check in app code → `UPDATE` | **20 of 20 succeeded** — 200 paid out of 100. Caught. |
+| 50 simultaneous requests at capacity 20 | read bucket → decide → write (no Lua) | **50 of 50 admitted** — the limiter did nothing under load. Caught by 3 tests. |
+
+The `SELECT`-then-`UPDATE` version passes every sequential test and is the most plausible way
+this code gets rewritten by someone who doesn't know why the conditional `UPDATE` looks odd.
+That is the regression these exist to prevent.
+
+They run in CI as a separate `concurrency` job backed by Postgres and Redis service containers,
+so a slow integration failure stays distinguishable from a fast unit failure.
+
 ### CI
 
 `.github/workflows/ci.yml` runs on every push/PR to `main`:
@@ -604,7 +637,9 @@ fakes through the handlers' dependency seams).
    so one broken package doesn't hide the state of the others.
 2. **`docker`** — `docker compose build`, which catches broken Dockerfiles that no amount of
    npm testing would.
-3. **`e2e`** — brings the whole stack up with `--wait`, then proves it works: register → login →
+3. **`concurrency`** — the money paths and the rate limiter against real Postgres and Redis
+   service containers (see the Concurrency tests section above).
+4. **`e2e`** — brings the whole stack up with `--wait`, then proves it works: register → login →
    deposit → a 422 over-withdrawal → an RBAC 403 → **token still valid → logout → same token
    now 401** → and that log rows actually reached Postgres. Container logs are dumped on
    failure. The logout step deliberately reuses the *same* token rather than logging in again,
@@ -664,5 +699,8 @@ Not yet done (natural next steps):
 - **Keyset pagination**: all list endpoints use `OFFSET`, which shifts under concurrent writes
   (see the Pagination section). `/payments/my` is the one whose data grows without bound and
   would most benefit from `WHERE created_at < last_seen`-style cursors.
+- **Wider concurrency coverage**: the money paths and the rate limiter now run against real
+  Postgres and Redis. `BatchBuffer`'s ack/nack under concurrent flushes, and the log-worker's
+  reconnect path, are still only covered by unit tests with fakes.
 - **No Prometheus metrics**: cache hit rate, rate-limit rejections, breaker transitions, and
   revocation hits are all computed and then only logged, so nothing can be alerted on.
